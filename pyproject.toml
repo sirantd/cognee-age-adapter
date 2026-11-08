@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cognee-age-adapter"
+version = "0.1.0"
+description = "A provenance-complete Apache AGE graph adapter for cognee"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+  # psycopg 3 binds the one agtype parameter map of cypher() as a server-side
+  # parameter ($1). AGE requires the third argument of cypher() to be a
+  # parameter, so the client-side binding of psycopg 2 cannot work here.
+  "psycopg[binary]>=3.2,<4",
+  "psycopg-pool>=3.2,<4",
+]
+
+[project.optional-dependencies]
+# cognee is a peer, not a runtime dependency: the adapter is installed INTO a
+# cognee image that already provides it. Pinned exactly for tests because the
+# contract suite is the only drift detector for the graph interface.
+#
+# 📌 1.6.7 is the version in the homelab cognee image when Stage A of
+# homelab#332 started (2026-11-08). The issue keeps this pin for the whole
+# migration: a cognee bump is out of scope until the cutover is done.
+test = [
+  "cognee==1.6.7",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cognee_age_adapter"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+  "integration: needs a live PostgreSQL with Apache AGE (AGE_HOST / AGE_PORT)",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["tests"]
