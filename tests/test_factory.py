@@ -37,7 +37,7 @@ engine_module = import_module("cognee.infrastructure.databases.graph.get_graph_e
 
 from cognee_age_adapter import AGEAdapter
 from cognee_age_adapter.constants import DEFAULT_GRAPH_NAME
-from cognee_age_adapter.register import PROVIDER_NAMES, ensure_registered
+from cognee_age_adapter.register import PROVIDER_NAME, ensure_registered
 
 import conftest
 
@@ -94,8 +94,7 @@ def test_constructor_binds_every_keyword_cognee_passes():
 
 def test_registration_binds_the_provider_name():
     ensure_registered()
-    for name in PROVIDER_NAMES:
-        assert supported_databases[name] is AGEAdapter
+    assert supported_databases[PROVIDER_NAME] is AGEAdapter
 
 
 def test_registration_refuses_a_vector_store_other_than_pgvector(monkeypatch):

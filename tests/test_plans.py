@@ -244,14 +244,7 @@ async def seeded(adapter):
 
 async def _record(adapter, call):
     """Run a real adapter call; return every (sql, args) it sent."""
-    sent = []
-    original = adapter._execute
-
-    async def recording(cursor, sql, args):
-        sent.append((sql, args))
-        await original(cursor, sql, args)
-
-    adapter._execute = recording
+    sent = conftest.record_sql(adapter)
     try:
         await call(adapter)
     finally:

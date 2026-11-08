@@ -21,13 +21,6 @@ jobs:
       - run: pip install -e '.[test]'
       - run: pytest -m "not integration"
 
-  age-source:
-    # homelab#332: the pinned PGDG package must be the ASF 1.8.0 release.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: ci/verify-age-source.sh
-
   contract:
     # The real gate: cognee's own provenance contract suite (20 cases,
     # unmodified) and the adapter's integration tests, against the PRODUCTION

@@ -1,0 +1,19 @@
+name: age-source
+
+# homelab#332: the pinned PGDG package must be the ASF 1.8.0 release. Every
+# input is pinned by hash, so the result changes only when a pin changes. The
+# check runs only then, or by hand.
+on:
+  push:
+    branches: [main]
+    paths: [ci/pins.env, ci/verify-age-source.sh, .github/workflows/age-source.yml]
+  pull_request:
+    paths: [ci/pins.env, ci/verify-age-source.sh, .github/workflows/age-source.yml]
+  workflow_dispatch:
+
+jobs:
+  age-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ci/verify-age-source.sh

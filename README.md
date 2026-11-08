@@ -15,9 +15,12 @@ disk-resident storage.
 cognee-falkordb-adapter 0.5.4, with the same public surface, provenance
 semantics and value rules. The CI gate runs against the production store:
 
-* cognee's own provenance contract suite passes **20/20** (cognee `1.6.7`).
-* Every query that the adapter emits reads its label tables through an index
-  (see [The plan gate](#the-plan-gate)).
+* cognee's own provenance contract suite must pass 20/20 (cognee `1.6.7`).
+* Every query that the adapter emits must read its label tables through an
+  index (see [The plan gate](#the-plan-gate)).
+
+On 2026-11-08 the full suite passed locally against `apache/age` and against
+the production image under amd64 emulation.
 
 The FalkorDB adapter stays the rollback path until homelab#332 Stage F.
 
@@ -54,8 +57,9 @@ keyword fails CI and not the first cognify.
    read-only mount (`ci/pins.env`, `ci/fetch-age.sh`) and two settings
    (`ci/init-cluster.sql`).
 2. A graph database with the extension, and a graph role that is **not** a
-   superuser, with the AGE preload and search path in its own settings
-   (`ci/init-graph-db.sql`).
+   superuser. The role's own settings hold the AGE preload, the search path and
+   a `statement_timeout` (`ci/init-graph-db.sql`). The search path is
+   load-bearing: AGE's own label DDL fails without `ag_catalog` in it.
 
 🚨 The adapter never sends `LOAD 'age'`. For a non-superuser it fails with
 `access to library "age" is not allowed`. AGE comes from the role's
@@ -91,6 +95,10 @@ and GIN indexes on the provenance lists. AGE makes the `id`, `start_id` and
 🚨 A btree entry holds approximately 2.7 kB. A relationship name longer than
 that fails its write. Measure the longest name before a migration.
 
+🚨 The edge identity index is unique. If the FalkorDB graph holds two edges
+with one source, one target and one relationship name, the second fails the
+load. The migration must count such duplicates first (homelab#332, Stage D).
+
 ## Query rules
 
 Each rule is a measurement on AGE 1.8.0, and each has a test.
@@ -122,15 +130,26 @@ adapter runs the losing transaction again, up to five times. A deadlock or a
 serialization failure is run again in the same way. The batches are sorted, so
 that two writers take the index locks in the same order.
 
+🚨 AGE does not re-check a row that a concurrent transaction updated, as a
+native `UPDATE` does. The `SET` waits for the other commit and then fails with
+`XX000 Entity failed to be updated: 3`. Every idempotent write runs again on
+this error. A provenance attach or remove reads the row again before it runs
+again, so the key of the other writer stays.
+
 ## Coercion
 
-`coercion.py` keeps the rules of the FalkorDB adapter unchanged, so that the
+`coercion.py` keeps the rules of the FalkorDB adapter unchanged. Then the
 nodes that a migration copies and the nodes that a re-cognify writes have the
-same form. On AGE two rules are load-bearing: a null in `SET n += {...}`
-deletes the property, so null-valued keys never leave Python; and a NUL in a
-parameter fails the whole statement, so `query()` strips it. Maps and nulls in
-arrays are stored natively by AGE, and are still encoded and dropped for the
-same form as on FalkorDB. `tests/test_coercion_live.py` asserts each behaviour.
+same form. Two rules are load-bearing on AGE:
+
+* A null in `SET n += {...}` deletes the property, so null-valued keys never
+  leave Python.
+* A NUL in a parameter fails the whole statement, so the adapter strips NUL
+  from the parameters of every statement.
+
+AGE stores maps and nulls in arrays natively. The adapter still encodes the
+maps and drops the nulls, for the same form as on FalkorDB.
+`tests/test_coercion_live.py` asserts each behaviour.
 
 ## The plan gate
 
@@ -175,12 +194,13 @@ AGE_PORT=55433 AGE_REQUIRED=1 .venv/bin/pytest
 
 ### CI
 
-* `surface`: the server-free tests.
-* `age-source`: the pinned PGDG package is the ASF 1.8.0 release
-  (`ci/verify-age-source.sh`).
-* `contract`: the production image digest, as uid 999 with its `PGDATA` and
-  command, AGE mounted read-only, and a non-superuser graph role.
-  `AGE_REQUIRED=1` turns an absent server into a failure, not 20 skips.
+* The `surface` job runs the server-free tests.
+* The `contract` job runs the integration tests on the production image digest,
+  as uid 999 with its `PGDATA` and command. AGE is mounted read-only, and the
+  tests connect as a non-superuser graph role. `AGE_REQUIRED=1` turns an absent
+  server into a failure, not 20 skips.
+* The `age-source` workflow proves that the pinned PGDG package is the ASF
+  1.8.0 release (`ci/verify-age-source.sh`). It runs when a pin changes.
 
 ### Pins
 

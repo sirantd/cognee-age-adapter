@@ -17,18 +17,17 @@ from cognee.infrastructure.databases.graph.use_graph_adapter import use_graph_ad
 from .adapter import AGEAdapter
 
 # The value of GRAPH_DATABASE_PROVIDER that selects this adapter.
-PROVIDER_NAMES = ("age",)
+PROVIDER_NAME = "age"
 
 
 def ensure_registered(assert_vector_provider: bool = True) -> None:
-    """Bind AGEAdapter under its provider name.
+    """Bind AGEAdapter under PROVIDER_NAME.
 
     ``assert_vector_provider`` fails loudly if the VECTOR store is set to
     anything other than pgvector. By the time cognee runs, it is too late to
     notice this cheaply.
     """
-    for name in PROVIDER_NAMES:
-        use_graph_adapter(name, AGEAdapter)
+    use_graph_adapter(PROVIDER_NAME, AGEAdapter)
 
     if assert_vector_provider:
         vector_provider = os.getenv("VECTOR_DB_PROVIDER", "").strip().lower()

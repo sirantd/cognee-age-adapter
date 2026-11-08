@@ -266,7 +266,7 @@ async def test_lookup_keys_are_scrubbed_the_same_way_the_write_was(adapter):
 async def test_a_relationship_name_is_scrubbed_like_every_other_value(adapter):
     await adapter.add_edge("a", "b", "is\x00related_to")
     edge = _params(adapter)["edges"][0]
-    assert edge["relationship_name"] == "isrelated_to"
+    assert edge["rel"] == "isrelated_to"
     assert edge["properties"]["relationship_name"] == "isrelated_to"
 
 
@@ -275,4 +275,4 @@ async def test_the_edge_property_cannot_change_the_edge_identity(adapter):
     different ``relationship_name`` in the property dict must not overwrite it."""
     await adapter.add_edge("a", "b", "knows", {"relationship_name": "other"})
     edge = _params(adapter)["edges"][0]
-    assert edge["relationship_name"] == edge["properties"]["relationship_name"] == "knows"
+    assert edge["rel"] == edge["properties"]["relationship_name"] == "knows"

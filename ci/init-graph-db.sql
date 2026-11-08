@@ -19,4 +19,9 @@ GRANT USAGE ON SCHEMA ag_catalog TO :"role";
 -- commands in a database without AGE under a cluster-wide preload (#2578) is on
 -- AGE master only.
 ALTER ROLE :"role" IN DATABASE :"database" SET session_preload_libraries = 'age';
+-- Load-bearing: AGE's own label DDL resolves graphid_ops through the search path.
 ALTER ROLE :"role" IN DATABASE :"database" SET search_path = ag_catalog, "$user", public;
+-- homelab#332 story 6: one long graph query stops and cannot freeze the store.
+-- 5 min is the query timeout of cognee's FalkorDB store (homelab #253); Stage C
+-- confirms the production value.
+ALTER ROLE :"role" IN DATABASE :"database" SET statement_timeout = '5min';

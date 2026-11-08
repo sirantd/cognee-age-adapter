@@ -77,9 +77,9 @@ EDGE_GIN_INDEXES = (
 )
 
 # Connection defaults, used only when cognee's config leaves the field empty.
-# 📌 There is no default for a WRONG value: cognee's unset port sentinel
-# (``GraphConfig.graph_database_port`` = 123) is passed through, so a missing
-# GRAPH_DATABASE_PORT is a refused connection on port 123 and not a silent
+# 📌 There is no default for a WRONG value. cognee's unset port sentinel
+# (``GraphConfig.graph_database_port`` = 123) is passed through. Then a missing
+# GRAPH_DATABASE_PORT is a refused connection on port 123, and not a silent
 # connection to another server.
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 5432

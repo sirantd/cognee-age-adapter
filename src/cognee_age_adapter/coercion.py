@@ -4,9 +4,10 @@ Two jobs, kept apart because they fail differently:
 
 * :func:`coerce_properties` — **shape**. The form in which a value reaches the
   store.
-* :func:`scrub_nul` — **transport**. What a parameter can carry. It runs at the
-  ``query()`` boundary, so it covers every path into AGE, also the paths that
-  never build a property map: tag lists, filter values, graph metadata and ids.
+* :func:`scrub_nul` — **transport**. What a parameter can carry. It runs on
+  the parameters of every statement (``AGEAdapter._cypher``), so it also covers
+  the paths that never build a property map: tag lists, filter values, graph
+  metadata and ids.
 
 📌 **The rules are the rules of cognee-falkordb-adapter 0.5.4, unchanged.**
 homelab#332 (story 28) requires that NUL bytes and odd model output reach the

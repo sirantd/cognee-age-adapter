@@ -3,12 +3,12 @@
 The connection settings come from the environment, with the defaults of the
 local container in the README:
 
-* ``AGE_HOST`` / ``AGE_PORT`` — the PostgreSQL server.
-* ``AGE_USER`` / ``AGE_PASSWORD`` — the graph role. 🚨 Never a superuser:
-  ``test_role.py`` fails the run if it is one.
-* ``AGE_DATABASE`` — the graph database, where the extension exists.
-* ``AGE_REQUIRED`` — ``1`` in CI. 🚨 **A skipped gate is a green gate.** Without
-  a server the fixtures skip, which is right on a laptop and a false pass in CI.
+* ``AGE_HOST`` and ``AGE_PORT`` name the PostgreSQL server.
+* ``AGE_USER`` and ``AGE_PASSWORD`` name the graph role. 🚨 It is never a
+  superuser: ``test_role.py`` fails the run if it is one.
+* ``AGE_DATABASE`` names the graph database, where the extension exists.
+* ``AGE_REQUIRED`` is ``1`` in CI. 🚨 A skipped gate is a green gate. Without a
+  server the fixtures skip, which is right on a laptop and a false pass in CI.
   With this flag set, an unreachable server fails the run instead.
 """
 
@@ -63,6 +63,24 @@ def new_adapter(graph_name: str) -> AGEAdapter:
         postgres_database=DATABASE,
         graph_database_name=graph_name,
     )
+
+
+def record_sql(adapter: AGEAdapter) -> list:
+    """Record every ``(sql, args)`` that ``adapter`` sends from now on.
+
+    Wraps ``_execute``, the one place the adapter sends SQL, so the recorded
+    statement is exactly what PostgreSQL receives. ``del adapter._execute``
+    stops the recording.
+    """
+    sent: list = []
+    original = adapter._execute
+
+    async def recording(cursor, sql, args):
+        sent.append((sql, args))
+        await original(cursor, sql, args)
+
+    adapter._execute = recording
+    return sent
 
 
 @asynccontextmanager

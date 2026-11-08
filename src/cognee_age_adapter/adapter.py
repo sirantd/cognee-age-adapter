@@ -5,28 +5,24 @@ public surface, the provenance semantics and the value rules are the same. The
 store layout is new, and the reasons are measurements of AGE 1.8.0 on
 2026-11-08 (``apache/age:release_PG18_1.8.0``, arm64):
 
-* **One vertex label, one edge label.** The cognee type is the ``type``
-  property, and the relationship name is the ``relationship_name`` property.
-  AGE makes one table for each label: 3,000 edge labels gave 12,012 relations
-  and a 485 ms plan for one untyped hop. See ``constants.py``.
-* **Every lookup by a value is ``UNWIND $values AS v ... WHERE n.p = v``.**
-  ⚠ The issue's feasibility notes say that a btree index serves ``IN``. It does
+* The graph has one vertex label and one edge label. The cognee type is the
+  ``type`` property, and the relationship name is the ``relationship_name``
+  property. ``constants.py`` has the measurement.
+* Every lookup by a value is ``UNWIND $values AS v ... WHERE n.p = v``. ⚠ The
+  feasibility notes of the issue say that a btree index serves ``IN``. It does
   not: ``WHERE n.id IN $ids`` compiles to ``agtype_in_operator(...)``, a filter
-  that no index serves, and the plan was a sequential scan. The equality inside
-  an ``UNWIND`` is an index scan. ``IN`` stays only as a filter after an
-  index-backed step.
-* **No ``MERGE`` for a vertex.** AGE matches the MERGE pattern with
-  ``properties @> {id: ...}``. Only a GIN index over ALL properties serves that,
-  and chunk text makes that index large. ``add_nodes`` instead creates the
-  missing ids, then updates every node through the unique ``id`` index, in one
-  transaction.
-* **Directed edge reads only.** An undirected ``(a)-[r]-(b)`` plans as a join
-  with an ``OR`` condition and read every vertex. Each undirected read here is
-  two directed reads joined by ``UNION``.
-* **Unique indexes on the node id and on the edge identity**
-  ``(start_id, end_id, relationship_name)``. Two concurrent writers of one node
-  or one edge get a unique violation, and the write runs again. On FalkorDB one
-  writer at a time made this impossible; on PostgreSQL it is not.
+  that no index serves. ``IN`` stays only as a filter after an index-backed step.
+* A vertex write uses no ``MERGE``. AGE matches a MERGE pattern with
+  ``properties @> {id: ...}``, and only a GIN index over ALL properties serves
+  that. ``add_nodes`` creates the absent ids, then updates every node through
+  the unique ``id`` index, in one transaction.
+* Every edge read is directed. An undirected ``(a)-[r]-(b)`` plans as a join
+  with an ``OR`` condition that reads every vertex. Each undirected read here
+  is two directed reads joined by ``UNION``.
+* Unique indexes on the node id and on the edge identity
+  ``(start_id, end_id, relationship_name)`` stop duplicates. Two concurrent
+  writers of one node or one edge get a unique violation, and the write runs
+  again.
 """
 
 from __future__ import annotations
@@ -112,6 +108,26 @@ _INDEXED_NODE_PROPERTIES = frozenset(name for name, _ in NODE_BTREE_INDEXES)
 # idempotent, so it runs again: the second time it finds what the winner made.
 _RETRIED_ERRORS = (errors.UniqueViolation, errors.DeadlockDetected, errors.SerializationFailure)
 
+# 🚨 AGE 1.8.0 (src/backend/executor/cypher_set.c): a SET on a vertex or an edge
+# that a concurrent transaction updated waits for that commit, and then FAILS
+# with XX000 "Entity failed to be updated: 3" (TM_Updated). A native UPDATE
+# would re-check the row instead. Measured with two writers on one graph.
+_AGE_UPDATE_CONFLICT = "Entity failed to be updated"
+
+
+def _lost_a_race(exc: Exception) -> bool:
+    """True if ``exc`` is a write that lost a race and can run again."""
+    if isinstance(exc, _RETRIED_ERRORS):
+        return True
+    return isinstance(exc, errors.InternalError_) and str(exc).startswith(_AGE_UPDATE_CONFLICT)
+
+
+async def _wait_before_retry(attempt: int, exc: Exception) -> None:
+    logger.info(
+        "Write lost a race (%s), attempt %d of %d", type(exc).__name__, attempt, WRITE_ATTEMPTS
+    )
+    await asyncio.sleep(0.02 * attempt + random.uniform(0, 0.02))
+
 # How long the first connection may take before initialize() reports the cause.
 _POOL_OPEN_TIMEOUT = 15.0
 
@@ -162,10 +178,10 @@ def _quote(identifier: str) -> str:
     """Backtick-quote a property name for interpolation into Cypher.
 
     A property name cannot be a parameter, so ``get_filtered_graph_data`` puts
-    it into the query text. AGE escapes a backtick inside a quoted identifier
-    by doubling it (measured: ``n.`we ird``key``` reads the key ``we ird`key``),
-    so a name with a backtick still names its own key and cannot end the
-    identifier. NUL is removed: the query text cannot hold it.
+    it into the query text. AGE reads two backticks inside a quoted identifier
+    as one backtick (measured). So a name with a backtick still names its own
+    key, and it cannot end the identifier. NUL is removed, because the query
+    text cannot hold it.
     """
     cleaned = scrub_nul(identifier)
     if cleaned != identifier:
@@ -282,6 +298,18 @@ def _node_tuples(rows: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]
     ]
 
 
+def _edges_by_identity(param: str) -> str:
+    """``UNWIND $<param>`` of ``{s, t, rel}`` maps, and match each edge by its identity.
+
+    Binds ``e`` to the map, ``a`` and ``b`` to the endpoints, and ``r`` to the
+    edge. The source comes through the unique ``id`` index, and the edge through
+    the ``start_id`` column of the edge identity index.
+    """
+    return f"""UNWIND ${param} AS e
+            MATCH (a:{N}) WHERE a.id = e.s
+            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = e.t AND r.{REL} = e.rel"""
+
+
 def _anchored_edges_query(filters: str = "", returns: Optional[str] = None) -> str:
     """Both directions of the edges of the nodes with ``id IN $anchor_ids``.
 
@@ -381,10 +409,12 @@ class AGEAdapter(GraphDBInterface):
             settings["dbname"] = postgres_database
         elif not conninfo_to_dict(url).get("dbname"):
             settings["dbname"] = self._graph_name
-        # 🚨 No LOAD 'age' and no search_path here. The graph role's settings
-        # preload AGE for its database (``session_preload_libraries``), and a
-        # LOAD from a non-superuser fails: `access to library "age" is not
-        # allowed`. Every name in a query is schema-qualified instead.
+        # 🚨 No LOAD 'age' and no search_path here: the graph role's own
+        # settings preload AGE and set the search path. A LOAD from a
+        # non-superuser fails with `access to library "age" is not allowed`.
+        # The search path is load-bearing. Measured: without ag_catalog in it,
+        # AGE's own label DDL fails (`operator class "graphid_ops" does not
+        # exist`). A client setting here would hide a role that lacks it.
         settings["application_name"] = "cognee-age-adapter"
 
         self._conninfo = make_conninfo(url, **settings)
@@ -471,9 +501,8 @@ class AGEAdapter(GraphDBInterface):
     ) -> List[List[Dict[str, Any]]]:
         """Run ``statements`` in one transaction; the rows of each.
 
-        With ``retry``, a transaction that lost a race (a unique violation, a
-        deadlock, a serialization failure) runs again, up to WRITE_ATTEMPTS
-        times. Only idempotent writes ask for it.
+        With ``retry``, a transaction that lost a race (see ``_lost_a_race``)
+        runs again, up to WRITE_ATTEMPTS times. Only idempotent writes ask for it.
         """
         await self._open_pool()
         attempt = 0
@@ -487,14 +516,14 @@ class AGEAdapter(GraphDBInterface):
                                 await self._cypher(cursor, query, params)
                                 for query, params in statements
                             ]
-            except _RETRIED_ERRORS as exc:
-                if not retry or attempt >= WRITE_ATTEMPTS:
+            except psycopg.Error as exc:
+                if not retry or attempt >= WRITE_ATTEMPTS or not _lost_a_race(exc):
                     raise
-                logger.info(
-                    "Write lost a race (%s), attempt %d of %d", type(exc).__name__, attempt,
-                    WRITE_ATTEMPTS,
-                )
-                await asyncio.sleep(0.02 * attempt + random.uniform(0, 0.02))
+                await _wait_before_retry(attempt, exc)
+
+    async def _write(self, query: str, params: Optional[dict] = None) -> List[Dict[str, Any]]:
+        """Run one idempotent write, again if it loses a race to another writer."""
+        return (await self._transaction([(query, params)], retry=True))[0]
 
     async def query(self, query: str, params: Optional[dict] = None) -> List[Any]:
         """Run a Cypher query and return its rows as dicts keyed by column name.
@@ -794,7 +823,7 @@ class AGEAdapter(GraphDBInterface):
         """Delete many nodes and their relationships."""
         if not node_ids:
             return
-        await self.query(
+        await self._write(
             f"""
             UNWIND $node_ids AS wanted
             MATCH (n:{N}) WHERE n.id = wanted
@@ -841,7 +870,7 @@ class AGEAdapter(GraphDBInterface):
             MATCH (n:{N})-[r:{E}]->(ns) WHERE r.{REL} = 'belongs_to_set'{scope}
             DELETE r
         """
-        await self._transaction([(strip, params), (prune, params)])
+        await self._transaction([(strip, params), (prune, params)], retry=True)
 
     async def get_node(self, node_id: str) -> Optional[NodeData]:
         """Retrieve one node's properties, or None."""
@@ -962,15 +991,15 @@ class AGEAdapter(GraphDBInterface):
             properties[REL] = identity[2]
             deduped[identity] = {**deduped.get(identity, {}), **properties}
         batch = [
-            {"from_node": s, "to_node": t, "relationship_name": rel, "properties": deduped[(s, t, rel)]}
+            {**self._edge_identity_row(EdgeIdentity(s, t, rel)), "properties": deduped[(s, t, rel)]}
             for s, t, rel in sorted(deduped)
         ]
 
         query = f"""
             UNWIND $edges AS edge
-            MATCH (from_node:{N}) WHERE from_node.id = edge.from_node
-            MATCH (to_node:{N}) WHERE to_node.id = edge.to_node
-            MERGE (from_node)-[rel:{E} {{{REL}: edge.relationship_name}}]->(to_node)
+            MATCH (source:{N}) WHERE source.id = edge.s
+            MATCH (target:{N}) WHERE target.id = edge.t
+            MERGE (source)-[rel:{E} {{{REL}: edge.rel}}]->(target)
             WITH rel, edge, edge.properties AS props, coalesce(rel.source_ref_keys, []) AS prov_keys_before
             SET rel += props
             SET rel.updated_at = timestamp(), rel.created_at = coalesce(rel.created_at, timestamp())
@@ -993,9 +1022,7 @@ class AGEAdapter(GraphDBInterface):
             return []
         rows = await self.query(
             f"""
-            UNWIND $edges AS e
-            MATCH (a:{N}) WHERE a.id = e.s
-            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = e.t AND r.{REL} = e.rel
+            {_edges_by_identity("edges")}
             RETURN DISTINCT a.id AS source_id, b.id AS target_id, r.{REL} AS relationship_name
             """,
             {
@@ -1102,9 +1129,7 @@ class AGEAdapter(GraphDBInterface):
         """Return ``{edge: (source_ref_keys, source_run_refs)}`` for existing edges."""
         rows = await self.query(
             f"""
-            UNWIND $edges AS e
-            MATCH (a:{N}) WHERE a.id = e.s
-            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = e.t AND r.{REL} = e.rel
+            {_edges_by_identity("edges")}
             RETURN a.id AS s, b.id AS t, r.{REL} AS rel,
                    coalesce(r.source_ref_keys, []) AS keys,
                    coalesce(r.source_run_refs, []) AS run_refs
@@ -1123,13 +1148,11 @@ class AGEAdapter(GraphDBInterface):
             return
         await self.query(
             f"""
-            UNWIND $batch AS row
-            MATCH (a:{N}) WHERE a.id = row.s
-            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = row.t AND r.{REL} = row.rel
-            SET r.source_ref_keys = row.refs,
-                r.source_dataset_ids = row.datasets,
-                r.source_run_ids = row.runs,
-                r.source_run_refs = row.run_refs
+            {_edges_by_identity("batch")}
+            SET r.source_ref_keys = e.refs,
+                r.source_dataset_ids = e.datasets,
+                r.source_run_ids = e.runs,
+                r.source_run_refs = e.run_refs
             """,
             {"batch": sorted(batch, key=lambda row: (row["s"], row["t"], row["rel"]))},
         )
@@ -1148,27 +1171,37 @@ class AGEAdapter(GraphDBInterface):
         the read-modify-write, and ``add_nodes`` / ``add_edges`` take the same
         lock whenever they fold an owner key.
 
-        ⚠ **The guarantee is per adapter instance.** ``asyncio.Lock`` does
-        nothing across processes, or across two adapters on one graph. cognee's
-        own adapters carry the same limitation and the same lock.
+        ⚠ **The lock is per adapter instance.** ``asyncio.Lock`` does nothing
+        across processes, or across two adapters on one graph. cognee's own
+        adapters carry the same limitation and the same lock. On AGE a write
+        from another process that overlaps the write here makes it fail
+        (``_lost_a_race``), and then the read and the transition run again on
+        the new values.
         """
         if not artifacts:
             return
         async with self._source_ref_change_lock:
-            current = await read_provenance(artifacts)
-            batch = []
-            for identity, (keys, run_refs) in current.items():
-                columns = transition(keys, run_refs)
-                batch.append(
-                    {
-                        **identity_row(identity),
-                        "refs": columns.source_ref_keys,
-                        "datasets": columns.source_dataset_ids,
-                        "runs": columns.source_run_ids,
-                        "run_refs": columns.source_run_refs,
-                    }
-                )
-            await write_provenance(batch)
+            for attempt in range(1, WRITE_ATTEMPTS + 1):
+                current = await read_provenance(artifacts)
+                batch = []
+                for identity, (keys, run_refs) in current.items():
+                    columns = transition(keys, run_refs)
+                    batch.append(
+                        {
+                            **identity_row(identity),
+                            "refs": columns.source_ref_keys,
+                            "datasets": columns.source_dataset_ids,
+                            "runs": columns.source_run_ids,
+                            "run_refs": columns.source_run_refs,
+                        }
+                    )
+                try:
+                    await write_provenance(batch)
+                    return
+                except psycopg.Error as exc:
+                    if attempt >= WRITE_ATTEMPTS or not _lost_a_race(exc):
+                        raise
+                    await _wait_before_retry(attempt, exc)
 
     async def attach_node_source_refs(
         self,
@@ -1245,11 +1278,9 @@ class AGEAdapter(GraphDBInterface):
         if not edges:
             return
         # DELETE r, never DETACH DELETE: the endpoints are other datasets' nodes.
-        await self.query(
+        await self._write(
             f"""
-            UNWIND $edges AS e
-            MATCH (a:{N}) WHERE a.id = e.s
-            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = e.t AND r.{REL} = e.rel
+            {_edges_by_identity("edges")}
             DELETE r
             """,
             {"edges": [self._edge_identity_row(edge) for edge in edges]},
@@ -1292,9 +1323,7 @@ class AGEAdapter(GraphDBInterface):
             return {}
         rows = await self.query(
             f"""
-            UNWIND $edges AS e
-            MATCH (a:{N}) WHERE a.id = e.s
-            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = e.t AND r.{REL} = e.rel
+            {_edges_by_identity("edges")}
             RETURN a.id AS s, b.id AS t, r.{REL} AS rel, properties(r) AS properties,
                    coalesce(r.source_ref_keys, []) AS srk,
                    coalesce(r.source_dataset_ids, []) AS sdi,
@@ -1647,7 +1676,7 @@ class AGEAdapter(GraphDBInterface):
         without_epoch = [item for item in items if item["epoch"] is None]
 
         if with_epoch:
-            rows = await self.query(
+            rows = await self._write(
                 f"""
                 UNWIND $items AS item
                 MATCH (n:{N}) WHERE n.id = item.node_id
@@ -1661,7 +1690,7 @@ class AGEAdapter(GraphDBInterface):
             updated |= {row["node_id"] for row in rows}
 
         if without_epoch:
-            rows = await self.query(
+            rows = await self._write(
                 f"""
                 UNWIND $items AS item
                 MATCH (n:{N}) WHERE n.id = item.node_id
@@ -1685,7 +1714,7 @@ class AGEAdapter(GraphDBInterface):
         📌 Not ``drop_graph``: that removes the indexes with the data, and only
         ``initialize()`` makes them again.
         """
-        await self.query("MATCH (n) DETACH DELETE n")
+        await self._write("MATCH (n) DETACH DELETE n")
 
     async def get_graph_data(self) -> Tuple[List[Node], List[EdgeData]]:
         """Every data node and edge, in the ``(id, properties)`` / 4-tuple shape."""

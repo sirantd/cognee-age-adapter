@@ -21,6 +21,7 @@ echo "$AGE_ASF_SHA512  $work/asf.tar.gz" | sha512sum -c -
 curl -fsSL -o "$work/orig.tar.gz" "$AGE_ORIG_URL"
 echo "$AGE_ORIG_SHA256  $work/orig.tar.gz" | sha256sum -c -
 curl -fsSL -o "$work/debian.tar.xz" "$AGE_DEBIAN_URL"
+echo "$AGE_DEBIAN_SHA256  $work/debian.tar.xz" | sha256sum -c -
 
 tar -xzf "$work/asf.tar.gz" -C "$work/asf"
 tar -xzf "$work/orig.tar.gz" -C "$work/pgdg"

@@ -54,6 +54,36 @@ def test_cypher_runs_on_a_fresh_connection_without_a_load(conn):
         conn.execute("SELECT ag_catalog.drop_graph(%s, true)", (graph,))
 
 
+def test_the_role_puts_ag_catalog_on_the_search_path(conn):
+    """🚨 Load-bearing. Measured: with ``search_path=public``, ``initialize()``
+    fails in AGE's own label DDL (``operator class "graphid_ops" does not
+    exist``). The adapter sets no search path, so the role must."""
+    assert conn.execute("SHOW search_path").fetchone()[0].startswith("ag_catalog")
+
+
+def test_the_role_has_a_statement_timeout(conn):
+    """homelab#332 story 6: one long query cannot freeze the store for all clients."""
+    assert conn.execute("SHOW statement_timeout").fetchone()[0] not in ("0", "0ms")
+
+
+def test_a_long_graph_query_stops_at_the_statement_timeout(conn):
+    graph = f"role_{uuid.uuid4().hex[:12]}"
+    conn.execute("SELECT ag_catalog.create_graph(%s)", (graph,))
+    try:
+        conn.execute("SET statement_timeout = '200ms'")
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            conn.execute(
+                f"SELECT * FROM ag_catalog.cypher('{graph}', "
+                # Two small lists, 10^10 rows: ``range(1, 10^9)`` fails on
+                # memory first, because AGE builds the whole list.
+                "$$ UNWIND range(1, 100000) AS a UNWIND range(1, 100000) AS b "
+                "RETURN count(b) $$) AS (v ag_catalog.agtype)"
+            )
+    finally:
+        conn.execute("RESET statement_timeout")
+        conn.execute("SELECT ag_catalog.drop_graph(%s, true)", (graph,))
+
+
 def test_the_extension_is_the_pinned_release(conn):
     assert conn.execute("SELECT extversion FROM pg_extension WHERE extname = 'age'").fetchone() == (
         "1.8.0",
