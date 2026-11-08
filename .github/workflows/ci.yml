@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  surface:
+    # The cheap gate: the interface surface and signatures against the pinned
+    # cognee, the factory keywords, the coercion rules, the Cypher composition,
+    # the agtype parser, and the contract-suite census and pin. It needs no
+    # server, so it selects "not integration" and not a file list, which would
+    # stop covering the next server-free module.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[test]'
+      - run: pytest -m "not integration"
+
+  age-source:
+    # homelab#332: the pinned PGDG package must be the ASF 1.8.0 release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ci/verify-age-source.sh
+
+  contract:
+    # The real gate: cognee's own provenance contract suite (20 cases,
+    # unmodified) and the adapter's integration tests, against the PRODUCTION
+    # store: the TrueNAS app's image digest unchanged, run as uid 999 with its
+    # PGDATA and command, AGE mounted read-only from the pinned PGDG package,
+    # the two path settings, and a non-superuser graph role with the AGE
+    # preload in its own settings. See ci/pins.env.
+    #
+    # 📌 Steps, not a `services:` container: a service starts before the
+    # checkout and cannot mount the AGE files.
+    runs-on: ubuntu-latest
+    env:
+      AGE_HOST: 127.0.0.1
+      AGE_PORT: "5432"
+      AGE_USER: cognee_graph
+      AGE_PASSWORD: cognee_graph
+      AGE_DATABASE: cognee_graph
+      # 🚨 A skipped gate is a green gate. Without a server the fixtures skip,
+      # and 20 skips read as 20 passes in the job summary. This fails instead.
+      AGE_REQUIRED: "1"
+      # The adapter refuses to register if anything points the VECTOR store
+      # away from pgvector.
+      VECTOR_DB_PROVIDER: pgvector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[test]'
+      - name: the AGE files of the pinned package, in the production mount layout
+        run: ci/fetch-age.sh "$RUNNER_TEMP/age"
+      - name: the production PostgreSQL image, with AGE mounted read-only
+        run: ci/start-postgres.sh "$RUNNER_TEMP/age"
+      - name: cognee provenance contract suite
+        # Its own step, so a red build says which half broke: cognee's
+        # contract, or the adapter's own behaviour. Expect "20 passed".
+        run: pytest tests/test_contract.py -v
+      - name: adapter integration tests
+        run: pytest -m integration -v --ignore=tests/test_contract.py
+      - name: server log
+        if: failure()
+        run: docker logs age

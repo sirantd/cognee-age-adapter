@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import uuid
 from contextlib import asynccontextmanager
+from typing import NoReturn
 
 import psycopg
 import pytest
@@ -38,7 +39,7 @@ def connect() -> psycopg.Connection:
     )
 
 
-def unreachable(exc: Exception) -> None:
+def unreachable(exc: Exception) -> NoReturn:
     message = f"AGE not reachable at {HOST}:{PORT}/{DATABASE} as {USER}: {exc}"
     if REQUIRE_SERVER:
         pytest.fail(message)

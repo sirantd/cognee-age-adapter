@@ -1,0 +1,193 @@
+# cognee-age-adapter
+
+A provenance-complete [Apache AGE](https://age.apache.org/) graph adapter for
+[cognee](https://github.com/topoteretes/cognee).
+
+It replaces [`cognee-falkordb-adapter`](https://github.com/sirantd/cognee-falkordb-adapter)
+in a homelab deployment ([homelab#332](https://github.com/sirantd/homelab/issues/332)).
+The graph moves into AGE, a PostgreSQL extension, in a shared PostgreSQL 18
+server. The graph gets WAL, MVCC, `statement_timeout`, `pg_dump` and
+disk-resident storage.
+
+## Status
+
+**Stage A of homelab#332: not deployed.** The adapter is a port of
+cognee-falkordb-adapter 0.5.4, with the same public surface, provenance
+semantics and value rules. The CI gate runs against the production store:
+
+* cognee's own provenance contract suite passes **20/20** (cognee `1.6.7`).
+* Every query that the adapter emits reads its label tables through an index
+  (see [The plan gate](#the-plan-gate)).
+
+The FalkorDB adapter stays the rollback path until homelab#332 Stage F.
+
+## Use
+
+Install the adapter into the cognee image, import the registration once, and
+set the graph provider:
+
+```python
+import cognee_age_adapter.register  # binds the "age" graph provider
+```
+
+| variable | value |
+|---|---|
+| `GRAPH_DATABASE_PROVIDER` | `age` |
+| `GRAPH_DATABASE_URL` | the PostgreSQL host, or a `postgresql://` URL |
+| `GRAPH_DATABASE_PORT` | `5432` |
+| `GRAPH_DATABASE_USERNAME` / `GRAPH_DATABASE_PASSWORD` | the graph role |
+| `GRAPH_DATABASE_NAME` | the AGE graph name, for example `cognee_graph` |
+| `VECTOR_DB_PROVIDER` | `pgvector`; the registration refuses any other vector store |
+
+The PostgreSQL database is the database of a `postgresql://` URL. With a bare
+host, the database has the name of the graph. So production uses one name,
+`cognee_graph`, for the database and for the graph.
+
+⚠ cognee constructs the adapter with its own keyword names
+(`graph_database_url`, `graph_database_port`, `database_name`, ...).
+`tests/test_factory.py` reads that call from cognee's source, so a renamed
+keyword fails CI and not the first cognify.
+
+### What the server must have
+
+1. AGE 1.8.0 available to the cluster. In production the files come from a
+   read-only mount (`ci/pins.env`, `ci/fetch-age.sh`) and two settings
+   (`ci/init-cluster.sql`).
+2. A graph database with the extension, and a graph role that is **not** a
+   superuser, with the AGE preload and search path in its own settings
+   (`ci/init-graph-db.sql`).
+
+🚨 The adapter never sends `LOAD 'age'`. For a non-superuser it fails with
+`access to library "age" is not allowed`. AGE comes from the role's
+`session_preload_libraries`, for the graph database only.
+
+`initialize()` creates the graph, its three labels and every index, if they
+are absent. cognee calls it when it builds the engine. The role needs no
+privilege on AGE's catalog tables.
+
+## Store layout
+
+| | AGE | FalkorDB adapter |
+|---|---|---|
+| cognee node | one vertex label `Node`; the cognee type in the `type` property | the type as a label |
+| relationship | one edge label `Edge`; the name in the `relationship_name` property | the name as an edge type |
+| graph metadata | one vertex of the label `GraphMetadata` | one node of its own label |
+
+🚨 One label each, because AGE makes one table for each label. Measured on
+2026-11-08: 3,000 edge labels made 12,012 relations, and one hop without a
+type took 485 ms to plan. `cognee_graph` has approximately 23,500 relationship
+names. As property values they make no tables, and one read takes any number of
+names (the FalkorDB 255-type limit is gone).
+
+### Indexes
+
+Btree expression indexes on the vertex properties `id` (unique), `type`,
+`document_id` and `source_chunk_id`. GIN expression indexes on the provenance
+lists and `belongs_to_set`. On the edges: a unique index on the identity
+`(start_id, end_id, relationship_name)`, a btree index on `relationship_name`,
+and GIN indexes on the provenance lists. AGE makes the `id`, `start_id` and
+`end_id` indexes itself.
+
+🚨 A btree entry holds approximately 2.7 kB. A relationship name longer than
+that fails its write. Measure the longest name before a migration.
+
+## Query rules
+
+Each rule is a measurement on AGE 1.8.0, and each has a test.
+
+* A lookup by a list of values is `UNWIND $values AS v ... WHERE n.p = v`.
+  `WHERE n.p IN $values` compiles to `agtype_in_operator`, which no index
+  serves. `IN` stays only as a filter after an index-backed step.
+* A pattern map `{id: $x}` compiles to `properties @> {...}`, which only a GIN
+  index over all properties serves. Lookups use `WHERE` instead.
+* A vertex `MERGE` matches with such a pattern map. So `add_nodes` creates the
+  absent ids, then updates every node through the unique `id` index, in one
+  transaction.
+* An undirected pattern `(a)-[r]-(b)` plans as an `OR` join over all vertices.
+  Each undirected read is two directed reads joined by `UNION`.
+* A query that starts with an `OPTIONAL MATCH` that matches nothing returns no
+  row, not one row of nulls. Start such a query with `UNWIND`.
+* `SET n += <expression>` needs a variable: `WITH n, $map AS m SET n += m`.
+* AGE refuses a trailing `;`, and `RETURN *` cannot run: AGE needs the column
+  list before the query runs. `query()` reads the columns from the last
+  `RETURN`.
+* A label is created in a statement of its own. 3,000 labels created in one
+  transaction failed with `out of shared memory`.
+
+### Concurrent writers
+
+Two cognify workers in two processes can create the same node or edge at the
+same moment. The unique indexes turn the race into a unique violation, and the
+adapter runs the losing transaction again, up to five times. A deadlock or a
+serialization failure is run again in the same way. The batches are sorted, so
+that two writers take the index locks in the same order.
+
+## Coercion
+
+`coercion.py` keeps the rules of the FalkorDB adapter unchanged, so that the
+nodes that a migration copies and the nodes that a re-cognify writes have the
+same form. On AGE two rules are load-bearing: a null in `SET n += {...}`
+deletes the property, so null-valued keys never leave Python; and a NUL in a
+parameter fails the whole statement, so `query()` strips it. Maps and nulls in
+arrays are stored natively by AGE, and are still encoded and dropped for the
+same form as on FalkorDB. `tests/test_coercion_live.py` asserts each behaviour.
+
+## The plan gate
+
+`tests/test_plans.py` calls every public method on a seeded graph, records each
+statement at the one place the adapter sends SQL, and asks PostgreSQL for the
+plan of exactly that statement with its parameters. With sequential scans, hash
+joins and merge joins disabled, the plan must have no disabled node, and every
+scan of a label table must carry an `Index Cond` or a `Recheck Cond`. A census
+fails when a public method is missing from the workload. Five methods read the
+whole graph by design, and they are listed by name.
+
+## Testing
+
+### Local
+
+Start a local AGE server and make the graph role:
+
+```sh
+docker run -d --name age-dev -e POSTGRES_PASSWORD=postgres -p 55432:5432 apache/age:release_PG18_1.8.0
+docker cp ci/init-graph-db.sql age-dev:/tmp/init.sql
+docker exec age-dev psql -U postgres -v ON_ERROR_STOP=1 \
+  -v role=cognee_graph -v password=cognee_graph -v database=cognee_graph -f /tmp/init.sql
+```
+
+Install and run the tests:
+
+```sh
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e '.[test]'
+.venv/bin/pytest -m "not integration"
+AGE_PORT=55432 AGE_REQUIRED=1 .venv/bin/pytest
+```
+
+For the production layout on a laptop, use the CI scripts. On arm64 they need
+amd64 emulation:
+
+```sh
+ci/fetch-age.sh .ci-age
+AGE_CONTAINER=age-prod AGE_PORT=55433 DOCKER_PLATFORM=linux/amd64 ci/start-postgres.sh .ci-age
+AGE_PORT=55433 AGE_REQUIRED=1 .venv/bin/pytest
+```
+
+### CI
+
+* `surface`: the server-free tests.
+* `age-source`: the pinned PGDG package is the ASF 1.8.0 release
+  (`ci/verify-age-source.sh`).
+* `contract`: the production image digest, as uid 999 with its `PGDATA` and
+  command, AGE mounted read-only, and a non-superuser graph role.
+  `AGE_REQUIRED=1` turns an absent server into a failure, not 20 skips.
+
+### Pins
+
+The pins are in `pyproject.toml` (cognee) and `ci/pins.env` (the PostgreSQL
+image and the AGE package). `tests/test_contract_pin.py` fails when the cognee
+pin or the 20 contract cases change.
+
+⚠ PGDG moves superseded packages from `apt.postgresql.org` to
+`apt-archive.postgresql.org`. If `ci/fetch-age.sh` fails with a 404, point
+`AGE_DEB_URL` at the archive; the sha256 pin stays.

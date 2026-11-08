@@ -35,7 +35,20 @@ import asyncio
 import json
 import random
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Type, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    LiteralString,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 from uuid import UUID
 
 import psycopg
@@ -107,16 +120,18 @@ E = EDGE_LABEL
 REL = RELATIONSHIP_PROPERTY
 
 
-def _strip_provenance(properties: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return ``properties`` without the four provenance list properties.
+def _strip_provenance(properties: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a copy of ``properties`` without the four provenance list properties.
 
     Provenance is storage-internal: it must not reach retrieval, DataPoint
     reconstruction or the ``*_properties`` field of the delete-data payload,
     which carries the four fields in their own typed slots.
     """
-    if not properties:
-        return dict(properties) if properties is not None else properties
-    return {key: value for key, value in properties.items() if key not in _PROVENANCE_KEY_SET}
+    return {
+        key: value
+        for key, value in (properties or {}).items()
+        if key not in _PROVENANCE_KEY_SET
+    }
 
 
 def _prov_list(value: Any) -> List[str]:
@@ -251,7 +266,7 @@ def _edge_tuple(row: Dict[str, Any]) -> EdgeData:
     ``source_node_id`` / ``target_node_id``: an edge that a bulk loader wrote
     can lack them.
     """
-    properties = _strip_provenance(row["properties"]) or {}
+    properties = _strip_provenance(row["properties"])
     return (
         properties.get("source_node_id", row["source"]),
         properties.get("target_node_id", row["target"]),
@@ -351,12 +366,13 @@ class AGEAdapter(GraphDBInterface):
 
         resolved_host = host or graph_database_url or DEFAULT_HOST
         url = str(resolved_host) if "://" in str(resolved_host) else ""
+        explicit_port = port or graph_database_port
         settings: Dict[str, Any] = {}
         if not url:
             settings["host"] = resolved_host
-            settings["port"] = int(port or graph_database_port or DEFAULT_PORT)
-        elif port or graph_database_port:
-            settings["port"] = int(port or graph_database_port)
+            settings["port"] = int(explicit_port or DEFAULT_PORT)
+        elif explicit_port:
+            settings["port"] = int(explicit_port)
         if graph_database_username:
             settings["user"] = graph_database_username
         if graph_database_password:
@@ -371,8 +387,9 @@ class AGEAdapter(GraphDBInterface):
         # allowed`. Every name in a query is schema-qualified instead.
         settings["application_name"] = "cognee-age-adapter"
 
+        self._conninfo = make_conninfo(url, **settings)
         self._pool = AsyncConnectionPool(
-            make_conninfo(url, **settings),
+            self._conninfo,
             min_size=POOL_MIN_SIZE,
             max_size=POOL_MAX_SIZE,
             open=False,
@@ -407,14 +424,19 @@ class AGEAdapter(GraphDBInterface):
                 # The pool only says "initialization incomplete". One direct
                 # connection raises the real cause: a wrong host, password or
                 # database, or a role without the AGE preload.
-                async with await psycopg.AsyncConnection.connect(self._pool.conninfo):
+                async with await psycopg.AsyncConnection.connect(self._conninfo):
                     pass
                 raise
             self._pool_open = True
 
     async def _execute(self, cursor: psycopg.AsyncCursor, sql: str, args: Any) -> None:
-        """The one place that sends SQL. The plan tests record what passes here."""
-        await cursor.execute(sql, args)
+        """The one place that sends SQL. The plan tests record what passes here.
+
+        The SQL is composed, not literal: ``compose()`` validates the graph name
+        and keeps the Cypher text inside its dollar quotes, and every value is
+        a bound parameter. The cast says so to the type checker.
+        """
+        await cursor.execute(cast(LiteralString, sql), args)
 
     async def _cypher(
         self, cursor: psycopg.AsyncCursor, query: str, params: Optional[dict]
