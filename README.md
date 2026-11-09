@@ -89,8 +89,14 @@ Btree expression indexes on the vertex properties `id` (unique), `type`,
 `document_id` and `source_chunk_id`. GIN expression indexes on the provenance
 lists and `belongs_to_set`. On the edges: a unique index on the identity
 `(start_id, end_id, relationship_name)`, a btree index on `relationship_name`,
-and GIN indexes on the provenance lists. AGE makes the `id`, `start_id` and
-`end_id` indexes itself.
+a btree index on the `id` column, and GIN indexes on the provenance lists.
+
+AGE makes the `id` index of a vertex label itself. For an edge label, AGE makes
+only the `start_id` and `end_id` indexes, so the adapter makes the `id` index.
+
+🚨 A Cypher `SET` finds its row through a btree index on `id`. Without that
+index, each edge `SET` scans the whole `Edge` table. The plan gate cannot see
+this scan, so `tests/test_indexes.py` reads the catalog.
 
 🚨 A btree entry holds approximately 2.7 kB. A relationship name longer than
 that fails its write. Measure the longest name before a migration.
