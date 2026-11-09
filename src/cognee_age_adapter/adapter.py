@@ -418,17 +418,7 @@ class AGEAdapter(GraphDBInterface):
         settings["application_name"] = "cognee-age-adapter"
 
         self._conninfo = make_conninfo(url, **settings)
-        self._pool = AsyncConnectionPool(
-            self._conninfo,
-            min_size=POOL_MIN_SIZE,
-            max_size=POOL_MAX_SIZE,
-            open=False,
-            kwargs={"autocommit": True},
-            # The shared PostgreSQL app restarts for its own maintenance. A
-            # connection from before a restart is replaced, not handed out dead.
-            check=AsyncConnectionPool.check_connection,
-            name=f"cognee-age-{self._graph_name}",
-        )
+        self._pool = self._new_pool()
         self._pool_lock = asyncio.Lock()
         self._pool_open = False
         # Serializes the read-modify-write of the explicit attach/remove
@@ -441,6 +431,24 @@ class AGEAdapter(GraphDBInterface):
     # Connection and statements
     # ------------------------------------------------------------------
 
+    def _new_pool(self) -> AsyncConnectionPool:
+        """Make a pool that is not open yet.
+
+        🚨 psycopg_pool cannot open a pool again after a close. Each close puts
+        a new pool in its place, or every later call fails with ``PoolClosed``.
+        """
+        return AsyncConnectionPool(
+            self._conninfo,
+            min_size=POOL_MIN_SIZE,
+            max_size=POOL_MAX_SIZE,
+            open=False,
+            kwargs={"autocommit": True},
+            # The shared PostgreSQL app restarts for its own maintenance. A
+            # connection from before a restart is replaced, not handed out dead.
+            check=AsyncConnectionPool.check_connection,
+            name=f"cognee-age-{self._graph_name}",
+        )
+
     async def _open_pool(self) -> None:
         if self._pool_open:
             return
@@ -450,7 +458,11 @@ class AGEAdapter(GraphDBInterface):
             try:
                 await self._pool.open(wait=True, timeout=_POOL_OPEN_TIMEOUT)
             except PoolTimeout:
+                # The server can be down for a restart. The new pool lets the
+                # next call try again. 🚨 Replace it before the probe below,
+                # because the probe raises.
                 await self._pool.close()
+                self._pool = self._new_pool()
                 # The pool only says "initialization incomplete". One direct
                 # connection raises the real cause: a wrong host, password or
                 # database, or a role without the AGE preload.
@@ -545,9 +557,15 @@ class AGEAdapter(GraphDBInterface):
                 return await cursor.fetchall() if cursor.description else []
 
     async def close(self) -> None:
-        """Release the pool. The contract fixture calls this after every case."""
-        await self._pool.close()
-        self._pool_open = False
+        """Close the pool. The next call opens a new pool.
+
+        The contract fixture calls this after every case. ``initialize()`` does
+        not run again: the graph, its labels and its indexes stay on the server.
+        """
+        async with self._pool_lock:
+            await self._pool.close()
+            self._pool = self._new_pool()
+            self._pool_open = False
 
     async def initialize(self) -> None:
         """Create the graph, its three labels and every index, if absent.
