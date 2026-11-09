@@ -66,6 +66,12 @@ def test_the_role_has_a_statement_timeout(conn):
     assert conn.execute("SHOW statement_timeout").fetchone()[0] not in ("0", "0ms")
 
 
+def test_the_role_has_an_idle_in_transaction_timeout(conn):
+    """homelab#332: a dead client cannot keep the locks of its open transaction."""
+    setting = conn.execute("SHOW idle_in_transaction_session_timeout").fetchone()[0]
+    assert setting not in ("0", "0ms")
+
+
 def test_a_long_graph_query_stops_at_the_statement_timeout(conn):
     graph = f"role_{uuid.uuid4().hex[:12]}"
     conn.execute("SELECT ag_catalog.create_graph(%s)", (graph,))

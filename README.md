@@ -57,8 +57,9 @@ keyword fails CI and not the first cognify.
    read-only mount (`ci/pins.env`, `ci/fetch-age.sh`) and two settings
    (`ci/init-cluster.sql`).
 2. A graph database with the extension, and a graph role that is **not** a
-   superuser. The role's own settings hold the AGE preload, the search path and
-   a `statement_timeout` (`ci/init-graph-db.sql`). The search path is
+   superuser. The role's own settings hold the AGE preload, the search path, a
+   `statement_timeout` and an `idle_in_transaction_session_timeout`
+   (`ci/init-graph-db.sql`). The search path is
    load-bearing: AGE's own label DDL fails without `ag_catalog` in it.
 
 🚨 The adapter never sends `LOAD 'age'`. For a non-superuser it fails with
