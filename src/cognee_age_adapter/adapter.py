@@ -573,6 +573,9 @@ class AGEAdapter(GraphDBInterface):
         🚨 **NOTHING ELSE CREATES THESE, AND THE FAILURE IS SILENT.** Without the
         ``id`` index each lookup reads the whole label, and the graph gets slower
         with every node. ``test_plans.py`` asserts the plan of every query.
+        Without the index on the ``id`` column of the edge label, each edge SET
+        reads the whole edge table. No plan shows that scan, so
+        ``test_indexes.py`` asserts the catalog.
 
         🚨 Labels are created **one statement in each transaction**. Measured:
         3,000 labels created in one transaction failed with ``out of shared
@@ -645,6 +648,14 @@ class AGEAdapter(GraphDBInterface):
         )
         statements.append(
             f'CREATE INDEX IF NOT EXISTS "{E.lower()}_{REL}_btree" ON {table(E)} ({access(REL)})'
+        )
+        # 🚨 The graphid column ``id``, not a property. AGE 1.8.0 indexes ``id``
+        # for a vertex label only (label_commands.c, line 430). A Cypher SET
+        # finds its row through a btree index on column 1, else it scans the
+        # whole label table (cypher_set.c, lines 717-799). The plan gate cannot
+        # see that scan: it is inside the "Cypher Set" node.
+        statements.append(
+            f'CREATE INDEX IF NOT EXISTS "{E.lower()}_id_btree" ON {table(E)} USING btree (id)'
         )
         for prop in EDGE_GIN_INDEXES:
             statements.append(
