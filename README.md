@@ -126,6 +126,18 @@ Each rule is a measurement on AGE 1.8.0, and each has a test.
   condition `r.source_dataset_ids @> [$id]` (651,981 actual), started from
   it, and took 138 s for a document of 22 nodes (homelab#332, D3). Such a
   condition goes after the anchor, in a form that no index serves (`$id IN`).
+* A match by edge identity is two statements. A SQL statement finds the
+  graphid of each edge, with each end as a scalar subquery on the unique `id`
+  index, so both ends are known before the edge scan. The Cypher statement
+  then matches `id(r)`, which `edge_id_btree` serves. Every Cypher form of the
+  identity match plans as a join: the planner estimated 9 edges for each
+  source and read all 1,271 edges of the largest source through the
+  `start_id` index (homelab#332, D5).
+* ⚠ The index of that edge scan is a cost decision: AGE's `start_id` and
+  `end_id` indexes also serve its condition. On the production-size copy the
+  identity index costs 25.4, a BitmapAnd of the two AGE indexes 30.7, and
+  either one alone approximately 57. The costs tie when each end has
+  approximately one edge. Both plan gates assert the identity index.
 * A pattern map `{id: $x}` compiles to `properties @> {...}`, which only a GIN
   index over all properties serves. Lookups use `WHERE` instead.
 * A vertex `MERGE` matches with such a pattern map. So `add_nodes` creates the
@@ -220,9 +232,11 @@ skipped unless `AGE_COPY_GRAPH` names the copy. See [Testing](#on-a-production-s
 Without a copy, a census still runs: each public read is probed or excluded by
 name.
 
-⚠ One known defect is a strict `xfail` (`KNOWN_DEFECTS`): a read by edge
-identity reads every outgoing edge of the source. On the copy, 20 edges of the
-node with the most outgoing edges read 25,551 label rows.
+The gate found D5 of homelab#332: a read by edge identity read every outgoing
+edge of the source (20 edges of the node with the most outgoing edges: 25,551
+label rows). The edge reads take 20 edges of that source and 20 edges of the
+NodeSet with the most incoming edges. A defect that the gate finds and that is
+still open goes into `KNOWN_DEFECTS` as a strict `xfail`.
 
 ## Testing
 

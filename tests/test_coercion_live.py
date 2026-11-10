@@ -21,6 +21,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from cognee.infrastructure.databases.provenance import EdgeIdentity, make_source_ref_key
 from cognee.infrastructure.engine import DataPoint
 
 from cognee_age_adapter.constants import EDGE_LABEL, NODE_LABEL
@@ -154,3 +155,40 @@ async def test_a_relationship_name_holding_nul_does_not_break_the_write(adapter)
 
     rows = await adapter.query(f"MATCH (:{NODE_LABEL})-[r:{EDGE_LABEL}]->(:{NODE_LABEL}) RETURN r.relationship_name AS rel")
     assert rows == [{"rel": "isrelated_to"}]
+
+
+# Each character that JSON escapes, and text outside ASCII.
+_ESCAPED_NAME = 'says "hi" \\ to\nthe\tgroup: Grüße, 名前 🚀'
+
+
+async def test_an_edge_identity_with_escaped_text_is_found_by_every_identity_method(adapter):
+    """🚨 homelab#332 D5: the identity lookup encodes the name in SQL
+    (``to_json``), and the write encoded it in the Cypher parameter map
+    (``json.dumps``). If the two forms differ, the lookup finds nothing, and
+    attach and delete skip the edge with no error."""
+    source, target = str(uuid4()), str(uuid4())
+    await adapter.add_nodes([_Ent(id=source, name="A"), _Ent(id=target, name="B")])
+    await adapter.add_edge(source, target, _ESCAPED_NAME)
+    edge = EdgeIdentity(source, target, _ESCAPED_NAME)
+    key = make_source_ref_key(uuid4(), uuid4())
+
+    assert await adapter.has_edges([(source, target, _ESCAPED_NAME, {})]) == [
+        (source, target, _ESCAPED_NAME, {})
+    ]
+    await adapter.attach_edge_source_refs([edge], [key])
+    assert (await adapter.get_edge_delete_data([edge]))[edge].source_ref_keys == [key]
+    await adapter.remove_edge_source_refs([edge], [key])
+    assert (await adapter.get_edge_delete_data([edge]))[edge].source_ref_keys == []
+
+    await adapter.delete_edge_triples([edge])
+    assert not await adapter.has_edge(source, target, _ESCAPED_NAME)
+
+
+async def test_has_edges_finds_a_relationship_name_that_lost_its_nul(adapter):
+    """The lookup scrubs NUL from the key, as the write scrubbed the name."""
+    source, target = str(uuid4()), str(uuid4())
+    await adapter.add_nodes([_Ent(id=source, name="A"), _Ent(id=target, name="B")])
+    await adapter.add_edge(source, target, "is\x00related_to")
+
+    assert await adapter.has_edge(source, target, "is\x00related_to")
+    assert await adapter.has_edge(source, target, "isrelated_to")
