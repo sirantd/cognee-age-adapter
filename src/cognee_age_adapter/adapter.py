@@ -20,19 +20,36 @@ store layout is new, and the reasons are measurements of AGE 1.8.0 on
   with an ``OR`` condition that reads every vertex. Each undirected read here
   is two directed reads joined by ``UNION``.
 * Unique indexes on the node id and on the edge identity
-  ``(start_id, end_id, relationship_name)`` stop duplicates. Two concurrent
-  writers of one node or one edge get a unique violation, and the write runs
-  again.
+  ``(start_id, end_id, relationship_name)`` stop duplicates.
+* Every node and edge write takes a transaction-level advisory lock for each
+  node id or edge identity first, in sorted order (homelab#332, D4). AGE fails
+  a SET on a row that a concurrent transaction updated, so two writers of one
+  node must not overlap. A write that still loses a race runs again.
+
+Two rules come from the plans at production size (207,123 nodes, 847,841
+edges, measured 2026-11-10). The CI plan gate cannot see them; the gate of
+``tests/test_plans_production.py`` runs on a copy:
+
+* PostgreSQL estimates 1,000 rows for every ``UNWIND`` of a parameter. For one
+  value, that estimate picks a Seq Scan and a hash join over the whole label,
+  so a filter with one value is ``n.p = $value`` (D2).
+* A read that starts from given nodes must not also carry a condition that an
+  index serves for many rows. The planner underestimates a GIN ``@>`` on the
+  dataset (818 rows estimated, 651,981 actual) and starts from it (D3).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from typing import (
     Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -73,12 +90,14 @@ from cognee.shared.logging_utils import get_logger
 from . import agtype
 from .coercion import coerce_properties, scrub_nul
 from .constants import (
+    ANCHOR_BATCH,
     CHUNK_TYPE,
     DEFAULT_GRAPH_NAME,
     DEFAULT_HOST,
     DEFAULT_PORT,
     EDGE_GIN_INDEXES,
     EDGE_LABEL,
+    LOCK_BATCH,
     METADATA_LABEL,
     METADATA_NODE_ID,
     NODE_BTREE_INDEXES,
@@ -127,6 +146,42 @@ async def _wait_before_retry(attempt: int, exc: Exception) -> None:
         "Write lost a race (%s), attempt %d of %d", type(exc).__name__, attempt, WRITE_ATTEMPTS
     )
     await asyncio.sleep(0.02 * attempt + random.uniform(0, 0.02))
+
+
+# 🚨 homelab#332 D4. Measured on production 2026-11-10: with 5 writers, 9 of
+# 80 batches failed after WRITE_ATTEMPTS, because each retry met the next
+# writer. So a node or edge write first waits for every other writer of the
+# same nodes or edges: one transaction-level advisory lock for each node id or
+# edge identity, in sorted order (two writers cannot wait on each other), in
+# the first statement. The Cypher statements after it read the rows only
+# after the other writer committed. The lock ends with the transaction.
+#
+# ⚠ The rows come out of unnest() in array order, and the locks are taken in
+# that order: a Function Scan with no other node returns its rows in order.
+_LOCK_SQL = "SELECT pg_catalog.pg_advisory_xact_lock(key) FROM unnest(%s::bigint[]) AS key"
+
+
+def _lock_key(graph: str, kind: str, *parts: str) -> int:
+    """A stable 64-bit advisory lock key for one node or one edge of one graph.
+
+    Not ``hash()``: Python salts it for each process, and the key must be equal
+    in every writer. A collision of two keys only makes two writers wait.
+    """
+    text = "\x00".join((graph, kind, *parts)).encode()
+    return int.from_bytes(hashlib.blake2b(text, digest_size=8).digest(), "big", signed=True)
+
+
+def _slices(items: Sequence[Any], size: int) -> List[Sequence[Any]]:
+    """``items`` in slices of at most ``size``, in their order."""
+    return [items[start : start + size] for start in range(0, len(items), size)]
+
+
+def _in_lock_batches(items: Sequence[Any]) -> List[Sequence[Any]]:
+    return _slices(items, LOCK_BATCH)
+
+
+# Runs one Cypher statement inside an open transaction: (query, params) -> rows.
+CypherRunner = Callable[[str, Optional[dict]], Awaitable[List[Dict[str, Any]]]]
 
 # How long the first connection may take before initialize() reports the cause.
 _POOL_OPEN_TIMEOUT = 15.0
@@ -508,30 +563,64 @@ class AGEAdapter(GraphDBInterface):
             for row in await cursor.fetchall()
         ]
 
+    @asynccontextmanager
+    async def _session(self, lock_keys: Iterable[int] = ()) -> AsyncIterator[CypherRunner]:
+        """One transaction; yields a runner of Cypher statements inside it.
+
+        With ``lock_keys``, the first statement takes their advisory locks, in
+        sorted order (see ``_LOCK_SQL``). The transaction commits when the block
+        ends, and that also releases the locks.
+        """
+        await self._open_pool()
+        async with self._pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    keys = sorted(set(lock_keys))
+                    if keys:
+                        await self._execute(cursor, _LOCK_SQL, (keys,))
+
+                    async def run(query: str, params: Optional[dict] = None):
+                        return await self._cypher(cursor, query, params)
+
+                    yield run
+
     async def _transaction(
-        self, statements: List[Tuple[str, Optional[dict]]], retry: bool = False
+        self,
+        statements: List[Tuple[str, Optional[dict]]],
+        retry: bool = False,
+        lock_keys: Iterable[int] = (),
     ) -> List[List[Dict[str, Any]]]:
         """Run ``statements`` in one transaction; the rows of each.
 
         With ``retry``, a transaction that lost a race (see ``_lost_a_race``)
         runs again, up to WRITE_ATTEMPTS times. Only idempotent writes ask for it.
+        ``lock_keys`` are taken first, as in ``_session``.
         """
-        await self._open_pool()
+        keys = list(lock_keys)
         attempt = 0
         while True:
             attempt += 1
             try:
-                async with self._pool.connection() as conn:
-                    async with conn.transaction():
-                        async with conn.cursor() as cursor:
-                            return [
-                                await self._cypher(cursor, query, params)
-                                for query, params in statements
-                            ]
+                async with self._session(keys) as run:
+                    return [await run(query, params) for query, params in statements]
             except psycopg.Error as exc:
                 if not retry or attempt >= WRITE_ATTEMPTS or not _lost_a_race(exc):
                     raise
                 await _wait_before_retry(attempt, exc)
+
+    def _node_lock_keys(self, node_ids: Iterable[str]) -> List[int]:
+        return [_lock_key(self._graph_name, "node", str(node_id)) for node_id in node_ids]
+
+    def _edge_lock_keys(self, edges: Iterable[Tuple[str, str, str]]) -> List[int]:
+        """Keys of edge identities ``(source, target, relationship name)``.
+
+        The identity, not the two end nodes: every edge of a NodeSet ends at the
+        one NodeSet node, so a lock on the ends would make every writer of a set
+        wait for every other.
+        """
+        return [
+            _lock_key(self._graph_name, "edge", str(s), str(t), str(rel)) for s, t, rel in edges
+        ]
 
     async def _write(self, query: str, params: Optional[dict] = None) -> List[Dict[str, Any]]:
         """Run one idempotent write, again if it loses a race to another writer."""
@@ -764,18 +853,21 @@ class AGEAdapter(GraphDBInterface):
     ) -> None:
         """Add or update many nodes, stamping provenance in the same write.
 
-        Two statements in ONE transaction, so no reader sees a half-written node:
+        Three statements in ONE transaction, so no reader sees a half-written node:
 
-        1. Create a bare ``{id}`` vertex for each id that is absent.
-        2. Update every node of the batch through the unique ``id`` index:
+        1. Lock each node id (``_LOCK_SQL``), so that a concurrent writer of the
+           same nodes commits first.
+        2. Create a bare ``{id}`` vertex for each id that is absent.
+        3. Update every node of the batch through the unique ``id`` index:
            ``SET n += properties``, the union of ``belongs_to_set``, and the
            provenance fold.
 
         🚨 The batch is deduplicated and SORTED by id first. A repeated id in
-        step 1 fails the statement (the second create of one id), and two
-        writers that insert overlapping ids in different orders can deadlock on
-        the unique index. In one order, the loser gets a unique violation, and
-        the transaction runs again (``retry``): then step 1 finds the node.
+        step 2 fails the statement (the second create of one id). A batch of
+        more than LOCK_BATCH nodes is written in transactions of LOCK_BATCH
+        nodes, in id order, so that one write cannot fill the lock table. A
+        write that still loses a race (a unique violation, or AGE's
+        ``Entity failed to be updated``) runs again (``retry``).
         """
         fold_clause = ""
         provenance_params: Dict[str, Any] = {}
@@ -836,13 +928,16 @@ class AGEAdapter(GraphDBInterface):
         # case ``test_concurrent_folded_writes_and_attaches_keep_every_owner``.
         fold_lock = self._source_ref_change_lock if source_ref_key is not None else nullcontext()
         async with fold_lock:
-            await self._transaction(
-                [
-                    (create_missing, {"ids": [entry["node_id"] for entry in batch]}),
-                    (update, {"nodes": batch, **provenance_params}),
-                ],
-                retry=True,
-            )
+            for part in _in_lock_batches(batch):
+                ids = [entry["node_id"] for entry in part]
+                await self._transaction(
+                    [
+                        (create_missing, {"ids": ids}),
+                        (update, {"nodes": list(part), **provenance_params}),
+                    ],
+                    retry=True,
+                    lock_keys=self._node_lock_keys(ids),
+                )
 
     async def delete_node(self, node_id: str) -> None:
         """Delete one node and its relationships."""
@@ -996,7 +1091,8 @@ class AGEAdapter(GraphDBInterface):
         timestamp.
 
         The batch is deduplicated by edge identity (later properties win, as
-        two SETs in sequence would) and sorted, for the reasons in
+        two SETs in sequence would), sorted, locked by edge identity and
+        written in transactions of LOCK_BATCH edges, for the reasons in
         ``add_nodes``. An edge whose endpoint is absent is not written.
         """
         if not edges:
@@ -1038,7 +1134,12 @@ class AGEAdapter(GraphDBInterface):
         # Same lock as ``add_nodes``, for the same race with the edge attach/remove.
         fold_lock = self._source_ref_change_lock if source_ref_key is not None else nullcontext()
         async with fold_lock:
-            await self._transaction([(query, {"edges": batch, **provenance_params})], retry=True)
+            for part in _in_lock_batches(batch):
+                await self._transaction(
+                    [(query, {"edges": list(part), **provenance_params})],
+                    retry=True,
+                    lock_keys=self._edge_lock_keys((e["s"], e["t"], e["rel"]) for e in part),
+                )
 
     async def has_edge(self, source_id: str, target_id: str, relationship_name: str) -> bool:
         """Return True when this exact edge exists."""
@@ -1122,10 +1223,10 @@ class AGEAdapter(GraphDBInterface):
         return []
 
     async def _read_node_provenance(
-        self, node_ids: List[str]
+        self, node_ids: List[str], run: CypherRunner
     ) -> Dict[str, Tuple[List[str], List[str]]]:
         """Return ``{node_id: (source_ref_keys, source_run_refs)}`` for existing nodes."""
-        rows = await self.query(
+        rows = await run(
             f"""
             UNWIND $ids AS wanted
             MATCH (n:{N}) WHERE n.id = wanted
@@ -1137,10 +1238,10 @@ class AGEAdapter(GraphDBInterface):
         )
         return {row["id"]: (_prov_list(row["keys"]), _prov_list(row["run_refs"])) for row in rows}
 
-    async def _write_node_provenance(self, batch: List[dict]) -> None:
+    async def _write_node_provenance(self, batch: List[dict], run: CypherRunner) -> None:
         if not batch:
             return
-        await self.query(
+        await run(
             f"""
             UNWIND $batch AS row
             MATCH (n:{N}) WHERE n.id = row.id
@@ -1153,10 +1254,10 @@ class AGEAdapter(GraphDBInterface):
         )
 
     async def _read_edge_provenance(
-        self, edges: List[EdgeIdentity]
+        self, edges: List[EdgeIdentity], run: CypherRunner
     ) -> Dict[EdgeIdentity, Tuple[List[str], List[str]]]:
         """Return ``{edge: (source_ref_keys, source_run_refs)}`` for existing edges."""
-        rows = await self.query(
+        rows = await run(
             f"""
             {_edges_by_identity("edges")}
             RETURN a.id AS s, b.id AS t, r.{REL} AS rel,
@@ -1172,10 +1273,10 @@ class AGEAdapter(GraphDBInterface):
             for row in rows
         }
 
-    async def _write_edge_provenance(self, batch: List[dict]) -> None:
+    async def _write_edge_provenance(self, batch: List[dict], run: CypherRunner) -> None:
         if not batch:
             return
-        await self.query(
+        await run(
             f"""
             {_edges_by_identity("batch")}
             SET r.source_ref_keys = e.refs,
@@ -1193,44 +1294,55 @@ class AGEAdapter(GraphDBInterface):
         write_provenance,
         identity_row,
         transition,
+        lock_keys,
     ) -> None:
         """Read each artifact's provenance, apply a pure transition, write it back.
 
-        Shared by attach/remove for both nodes and edges. The lock serializes
-        the read-modify-write, and ``add_nodes`` / ``add_edges`` take the same
-        lock whenever they fold an owner key.
+        Shared by attach/remove for both nodes and edges. The read and the
+        write run in ONE transaction, after the advisory locks of the artifacts
+        (``lock_keys``). So a writer in another process, which takes the same
+        locks, cannot commit between the read and the write, and the
+        transition always sees the current values. cognify calls this path
+        for every chunk-scoped owner (``add_data_points``).
 
-        ⚠ **The lock is per adapter instance.** ``asyncio.Lock`` does nothing
-        across processes, or across two adapters on one graph. cognee's own
-        adapters carry the same limitation and the same lock. On AGE a write
-        from another process that overlaps the write here makes it fail
-        (``_lost_a_race``), and then the read and the transition run again on
-        the new values.
+        The asyncio lock serializes this read-modify-write with the folded
+        ``add_nodes`` / ``add_edges`` of the same adapter, as cognee's own
+        adapters do. A write that still loses a race (a writer without the
+        locks, such as ``remove_belongs_to_set_tags``) runs again, read and all.
         """
         if not artifacts:
             return
         async with self._source_ref_change_lock:
-            for attempt in range(1, WRITE_ATTEMPTS + 1):
-                current = await read_provenance(artifacts)
-                batch = []
-                for identity, (keys, run_refs) in current.items():
-                    columns = transition(keys, run_refs)
-                    batch.append(
-                        {
-                            **identity_row(identity),
-                            "refs": columns.source_ref_keys,
-                            "datasets": columns.source_dataset_ids,
-                            "runs": columns.source_run_ids,
-                            "run_refs": columns.source_run_refs,
-                        }
-                    )
-                try:
-                    await write_provenance(batch)
-                    return
-                except psycopg.Error as exc:
-                    if attempt >= WRITE_ATTEMPTS or not _lost_a_race(exc):
-                        raise
-                    await _wait_before_retry(attempt, exc)
+            for part in _in_lock_batches(_dedupe(artifacts)):
+                for attempt in range(1, WRITE_ATTEMPTS + 1):
+                    try:
+                        async with self._session(lock_keys(part)) as run:
+                            current = await read_provenance(list(part), run)
+                            batch = []
+                            for identity, (keys, run_refs) in current.items():
+                                columns = transition(keys, run_refs)
+                                batch.append(
+                                    {
+                                        **identity_row(identity),
+                                        "refs": columns.source_ref_keys,
+                                        "datasets": columns.source_dataset_ids,
+                                        "runs": columns.source_run_ids,
+                                        "run_refs": columns.source_run_refs,
+                                    }
+                                )
+                            await write_provenance(batch, run)
+                        break
+                    except psycopg.Error as exc:
+                        if attempt >= WRITE_ATTEMPTS or not _lost_a_race(exc):
+                            raise
+                        await _wait_before_retry(attempt, exc)
+
+    def _node_artifact_lock_keys(self, node_ids: Sequence[Any]) -> List[int]:
+        return self._node_lock_keys(str(node_id) for node_id in node_ids)
+
+    def _edge_artifact_lock_keys(self, edges: Sequence[EdgeIdentity]) -> List[int]:
+        rows = (self._edge_identity_row(edge) for edge in edges)
+        return self._edge_lock_keys((row["s"], row["t"], row["rel"]) for row in rows)
 
     async def attach_node_source_refs(
         self,
@@ -1249,6 +1361,7 @@ class AGEAdapter(GraphDBInterface):
             lambda keys, run_refs: provenance_after_attach(
                 keys, run_refs, add_keys, pipeline_run_id
             ),
+            self._node_artifact_lock_keys,
         )
 
     async def attach_edge_source_refs(
@@ -1268,6 +1381,7 @@ class AGEAdapter(GraphDBInterface):
             lambda keys, run_refs: provenance_after_attach(
                 keys, run_refs, add_keys, pipeline_run_id
             ),
+            self._edge_artifact_lock_keys,
         )
 
     async def remove_node_source_refs(
@@ -1284,6 +1398,7 @@ class AGEAdapter(GraphDBInterface):
             self._write_node_provenance,
             self._node_identity_row,
             lambda keys, run_refs: provenance_after_remove(keys, run_refs, remove_keys),
+            self._node_artifact_lock_keys,
         )
 
     async def remove_edge_source_refs(
@@ -1300,6 +1415,7 @@ class AGEAdapter(GraphDBInterface):
             self._write_edge_provenance,
             self._edge_identity_row,
             lambda keys, run_refs: provenance_after_remove(keys, run_refs, remove_keys),
+            self._edge_artifact_lock_keys,
         )
 
     async def delete_edge_triples(self, edges: list[EdgeIdentity]) -> None:
@@ -1505,20 +1621,32 @@ class AGEAdapter(GraphDBInterface):
         is not chunk->chunk, is NOT returned. No cognee write path makes one. A
         miss leaves a stale ref (a leak, never an over-delete), and
         ``delete_by_dataset`` still removes it.
+
+        🚨 **The anchored read has no dataset condition that an index serves**
+        (homelab#332, D3). With ``r.source_dataset_ids @> [$dataset_id]`` the
+        planner started from the GIN index (818 rows estimated, 651,981
+        actual) and read every edge of the dataset: 138 s for a document of 22
+        nodes. The dataset is checked after the anchor, by ``$dataset_id IN``
+        (which no index serves) and exactly by ``_document_refs``. The anchors
+        go in slices of LOCK_BATCH, so one statement of a large document stays
+        short.
         """
         if not data_id:
             return {}
         params = {"dataset_id": dataset_id, "data_id": data_id}
-        node_ids = list(await self.find_node_source_refs_by_document(dataset_id, data_id))
+        node_ids = sorted(await self.find_node_source_refs_by_document(dataset_id, data_id))
         rows = []
-        if node_ids:
+        for anchors in _slices(node_ids, ANCHOR_BATCH):
             rows += await self.query(
                 _anchored_edges_query(
-                    filters="r.source_dataset_ids @> [$dataset_id]",
+                    filters=(
+                        "$dataset_id IN r.source_dataset_ids AND "
+                        "size([key IN r.source_ref_keys WHERE key CONTAINS $data_id]) > 0"
+                    ),
                     returns=f"""s.id AS s, t.id AS t, r.{REL} AS rel,
                         [key IN r.source_ref_keys WHERE key CONTAINS $data_id] AS keys""",
                 ),
-                {**params, "anchor_ids": sorted(node_ids)},
+                {**params, "anchor_ids": list(anchors)},
             )
         rows += await self.query(
             f"""
@@ -1703,33 +1831,31 @@ class AGEAdapter(GraphDBInterface):
         updated: Set[str] = set()
         with_epoch = [item for item in items if item["epoch"] is not None]
         without_epoch = [item for item in items if item["epoch"] is None]
+        set_with_epoch = f"""
+            UNWIND $items AS item
+            MATCH (n:{N}) WHERE n.id = item.node_id
+            SET n.truth_alignment = item.alignment,
+                n.truth_epoch = item.epoch,
+                n.updated_at = timestamp()
+            RETURN n.id AS node_id
+        """
+        set_without_epoch = f"""
+            UNWIND $items AS item
+            MATCH (n:{N}) WHERE n.id = item.node_id
+            SET n.truth_alignment = item.alignment,
+                n.updated_at = timestamp()
+            RETURN n.id AS node_id
+        """
 
-        if with_epoch:
-            rows = await self._write(
-                f"""
-                UNWIND $items AS item
-                MATCH (n:{N}) WHERE n.id = item.node_id
-                SET n.truth_alignment = item.alignment,
-                    n.truth_epoch = item.epoch,
-                    n.updated_at = timestamp()
-                RETURN n.id AS node_id
-                """,
-                {"items": with_epoch},
-            )
-            updated |= {row["node_id"] for row in rows}
-
-        if without_epoch:
-            rows = await self._write(
-                f"""
-                UNWIND $items AS item
-                MATCH (n:{N}) WHERE n.id = item.node_id
-                SET n.truth_alignment = item.alignment,
-                    n.updated_at = timestamp()
-                RETURN n.id AS node_id
-                """,
-                {"items": without_epoch},
-            )
-            updated |= {row["node_id"] for row in rows}
+        # The node locks of add_nodes, for the reason in ``_LOCK_SQL``.
+        for query, group in ((set_with_epoch, with_epoch), (set_without_epoch, without_epoch)):
+            for part in _in_lock_batches(group):
+                [rows] = await self._transaction(
+                    [(query, {"items": list(part)})],
+                    retry=True,
+                    lock_keys=self._node_lock_keys(item["node_id"] for item in part),
+                )
+                updated |= {row["node_id"] for row in rows}
 
         return {node_id: node_id in updated for node_id in node_ids}
 
@@ -1840,19 +1966,27 @@ class AGEAdapter(GraphDBInterface):
     async def _induced_edge_rows(self, node_ids: List[str]) -> List[Dict[str, Any]]:
         """Every edge between two nodes of ``node_ids``: source, target, type, properties.
 
-        From each node through the ``start_id`` index; the target is then a
-        filter on the edges of that node, not a second lookup.
+        Every outgoing edge of each node, through the ``start_id`` index; the
+        target is a set lookup in Python.
+
+        🚨 Not ``AND m.id IN $ids`` on the server (homelab#332, D1). That is an
+        ``agtype_in_operator`` over the whole list for each edge row, so the
+        read grew with the square of the scope: 12.7 s for the 5,339 nodes of
+        the ``homelab`` set on a production-size copy (amd64 emulation),
+        against 2.8 s for this form, which reads 1.6 times the induced edges.
         """
         if not node_ids:
             return []
-        return await self.query(
+        rows = await self.query(
             f"""
             UNWIND $ids AS wanted
-            MATCH (n:{N})-[r:{E}]->(m:{N}) WHERE n.id = wanted AND m.id IN $ids
+            MATCH (n:{N})-[r:{E}]->(m:{N}) WHERE n.id = wanted
             RETURN n.id AS source, m.id AS target, r.{REL} AS type, properties(r) AS properties
             """,
             {"ids": node_ids},
         )
+        wanted = set(node_ids)
+        return [row for row in rows if row["target"] in wanted]
 
     async def get_nodeset_subgraph(
         self, node_type: Type[Any], node_name: List[str], node_name_filter_operator: str = "OR"
@@ -1916,28 +2050,41 @@ class AGEAdapter(GraphDBInterface):
         The edge read starts from each matched node (``start_id`` index) and
         filters the target with the same attribute filters, so its cost follows
         the edges of the matched nodes.
+
+        🚨 **A filter with one value is ``n.p = $value``, not an UNWIND**
+        (homelab#332, D2). PostgreSQL estimates 1,000 rows for any UNWIND of a
+        parameter. On the production graph that estimate turned the
+        FactConflict read of every search into a Seq Scan and a hash join over
+        all 207,123 nodes (0.59 s). The equality gets the btree index.
         """
         if not attribute_filters:
             return [], []
 
         params: Dict[str, Any] = {}
+        lists: Dict[str, List[Any]] = {}
         clauses: Dict[str, str] = {}
+        single: Set[str] = set()
         driver: Optional[str] = None
         for index, (attribute, values) in enumerate(attribute_filters[0].items()):
             param = f"filter_{index}"
-            params[param] = _dedupe(values)
+            lists[param] = _dedupe(values)
+            if len(lists[param]) == 1:
+                single.add(param)
+                params[param] = lists[param][0]
+            else:
+                params[param] = lists[param]
             clauses[param] = _quote(attribute)
             if driver is None and attribute in _INDEXED_NODE_PROPERTIES:
                 driver = param
 
-        def conditions(alias: str, skip: Optional[str] = None) -> List[str]:
+        def conditions(alias: str, skip: Optional[str] = None, equality: bool = True) -> List[str]:
             return [
-                f"{alias}.{attribute} IN ${param}"
+                f"{alias}.{attribute} {'=' if equality and param in single else 'IN'} ${param}"
                 for param, attribute in clauses.items()
                 if param != skip
             ]
 
-        if driver:
+        if driver and driver not in single:
             where = " AND ".join([f"n.{clauses[driver]} = wanted", *conditions("n", driver)])
             node_query = f"""
                 UNWIND ${driver} AS wanted
@@ -1954,14 +2101,17 @@ class AGEAdapter(GraphDBInterface):
         if not include_edges or not nodes:
             return nodes, []
 
+        # The target filters stay ``IN`` with the list, which no index serves:
+        # the read starts from the matched nodes, and an index condition on the
+        # target could make the planner start from the target instead (D3).
         edge_rows = await self.query(
             f"""
             UNWIND $ids AS wanted
             MATCH (n:{N})-[r:{E}]->(m:{N})
-            WHERE n.id = wanted AND {" AND ".join(conditions("m"))}
+            WHERE n.id = wanted AND {" AND ".join(conditions("m", equality=False))}
             RETURN n.id AS source, m.id AS target, r.{REL} AS type, properties(r) AS properties
             """,
-            {**params, "ids": sorted({node_id for node_id, _ in nodes})},
+            {**lists, "ids": sorted({node_id for node_id, _ in nodes})},
         )
         return (nodes, [_edge_tuple(row) for row in edge_rows])
 

@@ -41,6 +41,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
   "integration: needs a live PostgreSQL with Apache AGE (AGE_HOST / AGE_PORT)",
+  "production_copy: needs a production-size copy of the graph (AGE_COPY_GRAPH)",
 ]
 
 [tool.pyright]

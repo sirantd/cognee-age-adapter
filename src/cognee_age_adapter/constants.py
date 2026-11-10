@@ -93,3 +93,17 @@ POOL_MAX_SIZE = 8
 # A write that fails on a unique violation (two workers create one node or one
 # edge) or on a deadlock or serialization failure is run again this many times.
 WRITE_ATTEMPTS = 5
+
+# The most nodes or edges that one write transaction locks (homelab#332, D4). A
+# larger batch is written in transactions of this size. 🚨 The advisory locks of
+# all sessions share the lock table of the whole server, for every database of
+# the app. Measured in a local container of the production image on 2026-11-10
+# (max_locks_per_transaction 64, max_connections 100): 14,000 locks fit and
+# 16,000 failed with "out of shared memory". 16 concurrent writes of 256 take
+# 4,096.
+LOCK_BATCH = 256
+
+# The most anchor nodes in one statement of a per-document lookup. A document
+# can own approximately 30,000 nodes, and one statement must stay far below the
+# production statement_timeout (5 min).
+ANCHOR_BATCH = 1000
