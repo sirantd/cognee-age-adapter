@@ -36,6 +36,14 @@ edges, measured 2026-11-10). The CI plan gate cannot see them; the gate of
 * A read that starts from given nodes must not also carry a condition that an
   index serves for many rows. The planner underestimates a GIN ``@>`` on the
   dataset (818 rows estimated, 651,981 actual) and starts from it (D3).
+
+A third rule comes from the same copy (D5). The planner estimates 9 edges
+for each source, so every Cypher form of a match by edge identity reads all
+outgoing edges of the source through AGE's ``start_id`` index (1,271 for the
+largest source). So a SQL statement finds the graphid of each edge, with both
+ends known before the edge scan, and the Cypher statement matches ``id(r)``.
+The index of that edge scan is a cost decision; ``_edge_id_sql`` has the
+margin.
 """
 
 from __future__ import annotations
@@ -180,15 +188,114 @@ def _in_lock_batches(items: Sequence[Any]) -> List[Sequence[Any]]:
     return _slices(items, LOCK_BATCH)
 
 
-# Runs one Cypher statement inside an open transaction: (query, params) -> rows.
-CypherRunner = Callable[[str, Optional[dict]], Awaitable[List[Dict[str, Any]]]]
-
 # How long the first connection may take before initialize() reports the cause.
 _POOL_OPEN_TIMEOUT = 15.0
 
 N = NODE_LABEL
 E = EDGE_LABEL
 REL = RELATIONSHIP_PROPERTY
+
+
+def _property(prop: str, alias: str = "") -> str:
+    """The SQL expression that AGE compiles ``x.<prop>`` into.
+
+    Every property index is on this expression, so a SQL condition must use it
+    exactly, or the planner cannot match the index.
+    """
+    column = f"{alias}.properties" if alias else "properties"
+    literal = json.dumps(prop).replace("'", "''")
+    return f"ag_catalog.agtype_access_operator(VARIADIC ARRAY[{column}, '{literal}'::{AGTYPE}])"
+
+
+def _edge_id_sql(graph: str) -> str:
+    """SQL that finds the graphid of each edge identity, or NULL if it is absent.
+
+    🚨 homelab#332 D5. Not Cypher: AGE compiles every Cypher form of a match by
+    identity to a join, and the planner then reads the edge through the
+    ``start_id`` index of the source with the name and the target as filters.
+    Measured on a production-size copy (2026-11-10): 20 edges of the source
+    with 1,271 outgoing edges read 25,551 label rows.
+
+    Here each end is a scalar subquery on the unique ``id`` index, so both
+    ends are known before the edge scan: the join order is fixed. ⚠ The index
+    of the edge scan is still a cost decision, because AGE's ``start_id`` and
+    ``end_id`` indexes also serve the condition. On the copy the planner
+    estimates 9 edges for each source and 72 for each target. So the identity
+    index (cost 25.4, one row) wins over a BitmapAnd of the two AGE indexes
+    (30.7) and over either one alone (approximately 57). The custom and the
+    generic plan read three label rows for each edge. When each end has
+    approximately one edge, the costs tie, and the planner can pick any of the
+    three; ``test_plans.py`` and ``tests/test_plans_production.py`` assert the
+    index.
+
+    The parameters are three text arrays: the source ids, the target ids and
+    the relationship names. Each row is ``(position, graphid)``, with the
+    position from 1.
+    """
+
+    def node_gid(alias: str, value: str) -> str:
+        return (
+            f'(SELECT {alias}.id FROM "{graph}"."{N}" {alias} '
+            f"WHERE {_property('id', alias)} = to_json({value})::text::{AGTYPE})"
+        )
+
+    return f"""
+        SELECT w.position, (
+            SELECT r.id::text FROM "{graph}"."{E}" r
+            WHERE r.start_id = {node_gid("a", "w.s")}
+              AND r.end_id = {node_gid("b", "w.t")}
+              AND {_property(REL, "r")} = to_json(w.rel)::text::{AGTYPE}
+        )
+        FROM unnest(%s::text[], %s::text[], %s::text[]) WITH ORDINALITY AS w(s, t, rel, position)
+    """
+
+
+# Binds ``e`` to one row of ``$edges``, which carries the graphid ``id`` from
+# ``_edge_id_sql``, and ``a``, ``r`` and ``b`` to the edge and its ends. Every
+# step is a lookup of one row: ``edge_id_btree``, then the vertex primary key.
+_EDGES_BY_ID = f"""UNWIND $edges AS e
+            MATCH (a:{N})-[r:{E}]->(b:{N}) WHERE id(r) = e.id"""
+
+
+class _Session:
+    """The statements of one open transaction.
+
+    A call runs one Cypher statement: ``(query, params) -> rows``.
+    """
+
+    def __init__(self, adapter: "AGEAdapter", cursor: psycopg.AsyncCursor):
+        self._adapter = adapter
+        self._cursor = cursor
+
+    async def __call__(self, query: str, params: Optional[dict] = None) -> List[Dict[str, Any]]:
+        return await self._adapter._cypher(self._cursor, query, params)
+
+    async def edge_ids(self, rows: Sequence[dict]) -> List[Optional[int]]:
+        """The graphid of the edge of each row (``s``, ``t``, ``rel``), or None."""
+        if not rows:
+            return []
+        # NUL is scrubbed as _cypher scrubs it, so a key finds what a write stored.
+        columns = [[scrub_nul(str(row[key])) for row in rows] for key in ("s", "t", "rel")]
+        await self._adapter._execute(self._cursor, self._adapter._edge_id_sql, columns)
+        found = {position: gid for position, gid in await self._cursor.fetchall()}
+        return [
+            int(gid) if (gid := found.get(position)) is not None else None
+            for position in range(1, len(rows) + 1)
+        ]
+
+    async def on_edges(self, rows: Sequence[dict], tail: str) -> List[Dict[str, Any]]:
+        """Run ``tail`` once for each row whose edge exists, matched by identity.
+
+        Each row is a map with ``s``, ``t`` and ``rel`` (``_edge_identity_row``),
+        and with the other values that ``tail`` reads from ``e``. ``tail`` sees
+        ``e``, ``a``, ``r`` and ``b`` (``_EDGES_BY_ID``). A row whose edge is
+        absent is dropped, as the match by identity dropped it.
+        """
+        ids = await self.edge_ids(rows)
+        found = [{**row, "id": gid} for row, gid in zip(rows, ids) if gid is not None]
+        if not found:
+            return []
+        return await self(f"{_EDGES_BY_ID}\n{tail}", {"edges": found})
 
 
 def _strip_provenance(properties: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -353,18 +460,6 @@ def _node_tuples(rows: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]
     ]
 
 
-def _edges_by_identity(param: str) -> str:
-    """``UNWIND $<param>`` of ``{s, t, rel}`` maps, and match each edge by its identity.
-
-    Binds ``e`` to the map, ``a`` and ``b`` to the endpoints, and ``r`` to the
-    edge. The source comes through the unique ``id`` index, and the edge through
-    the ``start_id`` column of the edge identity index.
-    """
-    return f"""UNWIND ${param} AS e
-            MATCH (a:{N}) WHERE a.id = e.s
-            MATCH (a)-[r:{E}]->(b:{N}) WHERE b.id = e.t AND r.{REL} = e.rel"""
-
-
 def _anchored_edges_query(filters: str = "", returns: Optional[str] = None) -> str:
     """Both directions of the edges of the nodes with ``id IN $anchor_ids``.
 
@@ -440,6 +535,7 @@ class AGEAdapter(GraphDBInterface):
         self._graph_name = validate_graph_name(
             database_name or graph_database_name or DEFAULT_GRAPH_NAME
         )
+        self._edge_id_sql = _edge_id_sql(self._graph_name)
 
         if graph_database_key:
             logger.warning(
@@ -564,8 +660,8 @@ class AGEAdapter(GraphDBInterface):
         ]
 
     @asynccontextmanager
-    async def _session(self, lock_keys: Iterable[int] = ()) -> AsyncIterator[CypherRunner]:
-        """One transaction; yields a runner of Cypher statements inside it.
+    async def _session(self, lock_keys: Iterable[int] = ()) -> AsyncIterator[_Session]:
+        """One transaction; yields the runner of its statements.
 
         With ``lock_keys``, the first statement takes their advisory locks, in
         sorted order (see ``_LOCK_SQL``). The transaction commits when the block
@@ -578,19 +674,15 @@ class AGEAdapter(GraphDBInterface):
                     keys = sorted(set(lock_keys))
                     if keys:
                         await self._execute(cursor, _LOCK_SQL, (keys,))
+                    yield _Session(self, cursor)
 
-                    async def run(query: str, params: Optional[dict] = None):
-                        return await self._cypher(cursor, query, params)
-
-                    yield run
-
-    async def _transaction(
+    async def _in_transaction(
         self,
-        statements: List[Tuple[str, Optional[dict]]],
+        work: Callable[[_Session], Awaitable[Any]],
         retry: bool = False,
         lock_keys: Iterable[int] = (),
-    ) -> List[List[Dict[str, Any]]]:
-        """Run ``statements`` in one transaction; the rows of each.
+    ) -> Any:
+        """Run ``work`` in one transaction; its result.
 
         With ``retry``, a transaction that lost a race (see ``_lost_a_race``)
         runs again, up to WRITE_ATTEMPTS times. Only idempotent writes ask for it.
@@ -602,11 +694,24 @@ class AGEAdapter(GraphDBInterface):
             attempt += 1
             try:
                 async with self._session(keys) as run:
-                    return [await run(query, params) for query, params in statements]
+                    return await work(run)
             except psycopg.Error as exc:
                 if not retry or attempt >= WRITE_ATTEMPTS or not _lost_a_race(exc):
                     raise
                 await _wait_before_retry(attempt, exc)
+
+    async def _transaction(
+        self,
+        statements: List[Tuple[str, Optional[dict]]],
+        retry: bool = False,
+        lock_keys: Iterable[int] = (),
+    ) -> List[List[Dict[str, Any]]]:
+        """Run ``statements`` in one transaction; the rows of each (see ``_in_transaction``)."""
+
+        async def work(run: _Session) -> List[List[Dict[str, Any]]]:
+            return [await run(query, params) for query, params in statements]
+
+        return await self._in_transaction(work, retry=retry, lock_keys=lock_keys)
 
     def _node_lock_keys(self, node_ids: Iterable[str]) -> List[int]:
         return [_lock_key(self._graph_name, "node", str(node_id)) for node_id in node_ids]
@@ -706,13 +811,9 @@ class AGEAdapter(GraphDBInterface):
 
         The expressions are exactly what AGE compiles ``n.<property>`` into, so
         the planner can match them: ``agtype_access_operator(VARIADIC
-        ARRAY[properties, '"<property>"'::agtype])``.
+        ARRAY[properties, '"<property>"'::agtype])`` (``_property``).
         """
         graph = self._graph_name
-
-        def access(prop: str) -> str:
-            literal = json.dumps(prop).replace("'", "''")
-            return f"ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '{literal}'::{AGTYPE}])"
 
         def table(label: str) -> str:
             return f'"{graph}"."{label}"'
@@ -721,22 +822,22 @@ class AGEAdapter(GraphDBInterface):
         for prop, unique in NODE_BTREE_INDEXES:
             statements.append(
                 f"CREATE {'UNIQUE ' if unique else ''}INDEX IF NOT EXISTS "
-                f'"{N.lower()}_{prop}_btree" ON {table(N)} ({access(prop)})'
+                f'"{N.lower()}_{prop}_btree" ON {table(N)} ({_property(prop)})'
             )
         for prop in NODE_GIN_INDEXES:
             statements.append(
                 f'CREATE INDEX IF NOT EXISTS "{N.lower()}_{prop}_gin" '
-                f"ON {table(N)} USING gin ({access(prop)})"
+                f"ON {table(N)} USING gin ({_property(prop)})"
             )
         # The edge identity of cognee, (source, target, relationship name). It is
         # UNIQUE so that two concurrent writers cannot make the same edge twice.
         # 🚨 A relationship name longer than approximately 2.7 kB fails the write.
         statements.append(
             f'CREATE UNIQUE INDEX IF NOT EXISTS "{E.lower()}_identity" '
-            f"ON {table(E)} (start_id, end_id, {access(REL)})"
+            f"ON {table(E)} (start_id, end_id, {_property(REL)})"
         )
         statements.append(
-            f'CREATE INDEX IF NOT EXISTS "{E.lower()}_{REL}_btree" ON {table(E)} ({access(REL)})'
+            f'CREATE INDEX IF NOT EXISTS "{E.lower()}_{REL}_btree" ON {table(E)} ({_property(REL)})'
         )
         # 🚨 The graphid column ``id``, not a property. AGE 1.8.0 indexes ``id``
         # for a vertex label only (label_commands.c, line 430). A Cypher SET
@@ -749,11 +850,11 @@ class AGEAdapter(GraphDBInterface):
         for prop in EDGE_GIN_INDEXES:
             statements.append(
                 f'CREATE INDEX IF NOT EXISTS "{E.lower()}_{prop}_gin" '
-                f"ON {table(E)} USING gin ({access(prop)})"
+                f"ON {table(E)} USING gin ({_property(prop)})"
             )
         statements.append(
             f'CREATE UNIQUE INDEX IF NOT EXISTS "{METADATA_LABEL.lower()}_id_btree" '
-            f"ON {table(METADATA_LABEL)} ({access('id')})"
+            f"ON {table(METADATA_LABEL)} ({_property('id')})"
         )
         return statements
 
@@ -1150,26 +1251,16 @@ class AGEAdapter(GraphDBInterface):
         """Return the subset of ``edges`` that exists, as ladybug and the interface do."""
         if not edges:
             return []
-        rows = await self.query(
-            f"""
-            {_edges_by_identity("edges")}
-            RETURN DISTINCT a.id AS source_id, b.id AS target_id, r.{REL} AS relationship_name
-            """,
-            {
-                "edges": [
-                    self._edge_identity_row(
-                        EdgeIdentity(
-                            source_id=str(edge[0]),
-                            target_id=str(edge[1]),
-                            relationship_name=str(edge[2]),
-                        )
-                    )
-                    for edge in edges
-                ]
-            },
-        )
-        found = {(row["source_id"], row["target_id"], row["relationship_name"]) for row in rows}
-        return [edge for edge in edges if (str(edge[0]), str(edge[1]), str(edge[2])) in found]
+        rows = [
+            self._edge_identity_row(
+                EdgeIdentity(
+                    source_id=str(edge[0]), target_id=str(edge[1]), relationship_name=str(edge[2])
+                )
+            )
+            for edge in edges
+        ]
+        ids = await self._in_transaction(lambda run: run.edge_ids(rows))
+        return [edge for edge, gid in zip(edges, ids) if gid is not None]
 
     async def get_edges(self, node_id: str) -> List[EdgeData]:
         """Every edge touching this node, as ``(node, other, {relationship_name})``."""
@@ -1223,7 +1314,7 @@ class AGEAdapter(GraphDBInterface):
         return []
 
     async def _read_node_provenance(
-        self, node_ids: List[str], run: CypherRunner
+        self, node_ids: List[str], run: _Session
     ) -> Dict[str, Tuple[List[str], List[str]]]:
         """Return ``{node_id: (source_ref_keys, source_run_refs)}`` for existing nodes."""
         rows = await run(
@@ -1238,7 +1329,7 @@ class AGEAdapter(GraphDBInterface):
         )
         return {row["id"]: (_prov_list(row["keys"]), _prov_list(row["run_refs"])) for row in rows}
 
-    async def _write_node_provenance(self, batch: List[dict], run: CypherRunner) -> None:
+    async def _write_node_provenance(self, batch: List[dict], run: _Session) -> None:
         if not batch:
             return
         await run(
@@ -1254,17 +1345,16 @@ class AGEAdapter(GraphDBInterface):
         )
 
     async def _read_edge_provenance(
-        self, edges: List[EdgeIdentity], run: CypherRunner
+        self, edges: List[EdgeIdentity], run: _Session
     ) -> Dict[EdgeIdentity, Tuple[List[str], List[str]]]:
         """Return ``{edge: (source_ref_keys, source_run_refs)}`` for existing edges."""
-        rows = await run(
+        rows = await run.on_edges(
+            [self._edge_identity_row(edge) for edge in edges],
             f"""
-            {_edges_by_identity("edges")}
             RETURN a.id AS s, b.id AS t, r.{REL} AS rel,
                    coalesce(r.source_ref_keys, []) AS keys,
                    coalesce(r.source_run_refs, []) AS run_refs
             """,
-            {"edges": [self._edge_identity_row(edge) for edge in edges]},
         )
         return {
             EdgeIdentity(
@@ -1273,18 +1363,17 @@ class AGEAdapter(GraphDBInterface):
             for row in rows
         }
 
-    async def _write_edge_provenance(self, batch: List[dict], run: CypherRunner) -> None:
+    async def _write_edge_provenance(self, batch: List[dict], run: _Session) -> None:
         if not batch:
             return
-        await run(
-            f"""
-            {_edges_by_identity("batch")}
+        await run.on_edges(
+            sorted(batch, key=lambda row: (row["s"], row["t"], row["rel"])),
+            """
             SET r.source_ref_keys = e.refs,
                 r.source_dataset_ids = e.datasets,
                 r.source_run_ids = e.runs,
                 r.source_run_refs = e.run_refs
             """,
-            {"batch": sorted(batch, key=lambda row: (row["s"], row["t"], row["rel"]))},
         )
 
     async def _apply_source_ref_change(
@@ -1422,14 +1511,9 @@ class AGEAdapter(GraphDBInterface):
         """Delete exactly these relationships, keeping both endpoints."""
         if not edges:
             return
+        rows = [self._edge_identity_row(edge) for edge in edges]
         # DELETE r, never DETACH DELETE: the endpoints are other datasets' nodes.
-        await self._write(
-            f"""
-            {_edges_by_identity("edges")}
-            DELETE r
-            """,
-            {"edges": [self._edge_identity_row(edge) for edge in edges]},
-        )
+        await self._in_transaction(lambda run: run.on_edges(rows, "DELETE r"), retry=True)
 
     async def get_node_delete_data(self, node_ids: list[str]) -> dict[str, NodeDeleteData]:
         if not node_ids:
@@ -1466,17 +1550,15 @@ class AGEAdapter(GraphDBInterface):
     ) -> dict[EdgeIdentity, EdgeDeleteData]:
         if not edges:
             return {}
-        rows = await self.query(
-            f"""
-            {_edges_by_identity("edges")}
+        wanted = [self._edge_identity_row(edge) for edge in edges]
+        tail = f"""
             RETURN a.id AS s, b.id AS t, r.{REL} AS rel, properties(r) AS properties,
                    coalesce(r.source_ref_keys, []) AS srk,
                    coalesce(r.source_dataset_ids, []) AS sdi,
                    coalesce(r.source_run_ids, []) AS sri,
                    coalesce(r.source_run_refs, []) AS srr
-            """,
-            {"edges": [self._edge_identity_row(edge) for edge in edges]},
-        )
+            """
+        rows = await self._in_transaction(lambda run: run.on_edges(wanted, tail))
         # Lazy import: this helper lives in cognee's modules layer, whose package
         # __init__ reaches the graph engine. At delete time the cycle is closed.
         from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text

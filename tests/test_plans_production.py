@@ -11,6 +11,11 @@ production size (207,123 nodes, 847,841 edges):
   dataset (651,981 edges), not from the nodes of the document. A small
   document took 138 s, and a large one passed the 5 min ``statement_timeout``.
 
+This gate then found D5: a read by edge identity read every outgoing edge of
+the source through the ``start_id`` index. 20 edges of the source with the most
+edges read 25,551 label rows. The edge reads take 20 edges of that source and
+20 edges of the target with the most incoming edges (a NodeSet).
+
 This file runs those reads on a copy, with the default planner settings, and
 limits the label rows that each statement reads by the size of its input:
 
@@ -103,6 +108,34 @@ async def copy_adapter(statement_timeout):
         await instance.close()
 
 
+async def _hub_edges(adapter, end: str) -> List[EdgeIdentity]:
+    """20 edges of the node with the most edges at ``end`` (``source`` or ``target``).
+
+    A read by edge identity must not depend on the other edges of either end
+    (homelab#332, D5). The source hub has the most outgoing edges; the target
+    hub, a NodeSet, has the most incoming edges.
+    """
+    column, hub_alias = ("start_id", "s") if end == "source" else ("end_id", "t")
+    with conftest.connect() as conn:
+        # An agtype string cast to text is the bare string, not JSON.
+        hub = conn.execute(
+            f"""
+            SELECT {_ID.format(alias="n")}::text FROM "{COPY_GRAPH}"."{NODE_LABEL}" n
+            WHERE n.id = (SELECT {column} FROM "{COPY_GRAPH}"."{EDGE_LABEL}"
+                          GROUP BY {column} ORDER BY count(*) DESC, {column} LIMIT 1)
+            """
+        ).fetchone()[0]
+    rows = await adapter.query(
+        f"""
+        MATCH (s:{NODE_LABEL})-[r:{EDGE_LABEL}]->(t:{NODE_LABEL}) WHERE {hub_alias}.id = $hub
+        RETURN s.id AS s, t.id AS t, r.relationship_name AS rel
+        ORDER BY s, t, rel LIMIT 20
+        """,
+        {"hub": hub},
+    )
+    return [EdgeIdentity(row["s"], row["t"], row["rel"]) for row in rows]
+
+
 async def _discover(adapter) -> Dict[str, Any]:
     """The probe inputs, read from the copy once."""
     if _inputs:
@@ -122,24 +155,6 @@ async def _discover(adapter) -> Dict[str, Any]:
     )
     assert len(chunks) >= 10 and len(entities) == 100, "the copy is not a production-size graph"
     entity_ids = [row["id"] for row in entities]
-    # 20 edges of the node with the most outgoing edges: a read by edge identity
-    # must not depend on the other edges of the source.
-    with conftest.connect() as conn:
-        hub = conn.execute(
-            f"""
-            SELECT {_ID.format(alias="n")}::text FROM "{COPY_GRAPH}"."{NODE_LABEL}" n
-            WHERE n.id = (SELECT start_id FROM "{COPY_GRAPH}"."{EDGE_LABEL}"
-                          GROUP BY start_id ORDER BY count(*) DESC, start_id LIMIT 1)
-            """
-        ).fetchone()[0]
-    edges = await adapter.query(
-        f"""
-        MATCH (n:{NODE_LABEL})-[r:{EDGE_LABEL}]->(m:{NODE_LABEL}) WHERE n.id = $hub
-        RETURN n.id AS s, m.id AS t, r.relationship_name AS rel
-        ORDER BY t, rel LIMIT 20
-        """,
-        {"hub": hub},
-    )
     sets = await adapter.query(
         f"""
         MATCH (s:{NODE_LABEL})-[r:{EDGE_LABEL}]->(n:{NODE_LABEL})
@@ -171,7 +186,7 @@ async def _discover(adapter) -> Dict[str, Any]:
     _inputs.update(
         chunks=sorted(row["id"] for row in chunks)[:10],
         entities=entity_ids,
-        edges=[EdgeIdentity(row["s"], row["t"], row["rel"]) for row in edges],
+        hub_edges={end: await _hub_edges(adapter, end) for end in ("source", "target")},
         source_ref_key=next(row["keys"][0] for row in entities if row["keys"]),
         run_id=next((row["runs"][0] for row in entities if row["runs"]), None),
         # A set of approximately 1,000 members: a scope read, not the whole graph.
@@ -209,11 +224,12 @@ async def _node_reads(adapter, inputs) -> None:
 
 
 async def _edge_reads(adapter, inputs) -> None:
-    edges = inputs["edges"]
-    triples = [(edge.source_id, edge.target_id, edge.relationship_name) for edge in edges]
-    await adapter.has_edge(*triples[0])
-    await adapter.has_edges([(*triple, {}) for triple in triples])
-    await adapter.get_edge_delete_data(edges)
+    for edges in inputs["hub_edges"].values():
+        assert len(edges) == 20, "the copy has no hub of 20 edges"
+        triples = [(edge.source_id, edge.target_id, edge.relationship_name) for edge in edges]
+        await adapter.has_edge(*triples[0])
+        await adapter.has_edges([(*triple, {}) for triple in triples])
+        await adapter.get_edge_delete_data(edges)
 
 
 async def _source_ref_reads(adapter, inputs) -> None:
@@ -329,16 +345,29 @@ def test_every_public_read_is_probed_or_excluded_by_name():
 
 
 async def _record(adapter, call) -> List[tuple]:
+    """The Cypher statements and the edge-id lookups (D5) that ``call`` sends."""
     sent = conftest.record_sql(adapter)
     try:
         await call
     finally:
         del adapter._execute
-    return [(text, args) for text, args in sent if text.startswith("SELECT * FROM ag_catalog.cypher")]
+    return [
+        (text, args) for text, args in sent if _is_cypher(text) or text == adapter._edge_id_sql
+    ]
+
+
+def _is_cypher(statement: str) -> bool:
+    return statement.startswith("SELECT * FROM ag_catalog.cypher")
 
 
 def _cypher_text(statement: str) -> str:
-    return statement.split("$cypher$")[1]
+    """The Cypher text of a Cypher statement; the SQL of any other statement."""
+    return statement.split("$cypher$")[1] if _is_cypher(statement) else statement
+
+
+def _parameters(statement: str, args) -> dict:
+    """The parameter map of a Cypher statement; none for any other statement."""
+    return json.loads(args[0]) if _is_cypher(statement) else {}
 
 
 def _explain(conn: psycopg.Connection, statement: str, args, generic: bool) -> dict:
@@ -346,22 +375,47 @@ def _explain(conn: psycopg.Connection, statement: str, args, generic: bool) -> d
     options = "ANALYZE, BUFFERS, FORMAT JSON"
     if not generic:
         return conn.execute(f"EXPLAIN ({options}) {statement}", args).fetchone()[0][0]
-    # The recorded SQL binds the parameter map as the last ``%s``, and doubles
-    # every ``%`` of the Cypher text for psycopg. A PREPARE is sent without
-    # parameters, so the text is sent as it is: undo both.
-    head, tail = statement.rsplit(", %s) AS (", 1)
-    prepared = (head + ", $1) AS (" + tail).replace("%%", "%")
+    if _is_cypher(statement):
+        # The recorded SQL binds the parameter map as the last ``%s``, and
+        # doubles every ``%`` of the Cypher text for psycopg. A PREPARE is sent
+        # without parameters, so the text is sent as it is: undo both.
+        head, tail = statement.rsplit(", %s) AS (", 1)
+        prepared = (head + ", $1) AS (" + tail).replace("%%", "%")
+        types = "(ag_catalog.agtype)"
+    else:
+        # The edge-id lookup: each ``%s`` is cast, so PREPARE infers the types.
+        pieces = statement.split("%s")
+        prepared = pieces[0] + "".join(f"${n}{piece}" for n, piece in enumerate(pieces[1:], 1))
+        types = ""
     conn.execute("SET plan_cache_mode = force_generic_plan")
-    conn.execute(f"PREPARE probe(ag_catalog.agtype) AS {prepared}")
+    conn.execute(f"PREPARE probe{types} AS {prepared}")
     try:
         # A literal, not a parameter: EXECUTE takes its arguments as expressions.
         execute = sql.SQL("EXPLAIN ({}) EXECUTE probe({})").format(
-            sql.SQL(options), sql.Literal(args[0])
+            sql.SQL(options), sql.SQL(", ").join(sql.Literal(arg) for arg in args)
         )
         return conn.execute(execute).fetchone()[0][0]
     finally:
         conn.execute("DEALLOCATE probe")
         conn.execute("RESET plan_cache_mode")
+
+
+def _edge_scans(node: dict) -> List[tuple]:
+    """``(node type, index)`` of each scan of the edge label.
+
+    A bitmap scan names its indexes in its children, which ``_label_rows``
+    does not count: a BitmapAnd of the ``start_id`` and ``end_id`` indexes
+    reads every index entry of both ends and returns one label row.
+    """
+    scans = []
+    if node.get("Relation Name") == EDGE_LABEL:
+        index = node.get("Index Name") or tuple(
+            child.get("Index Name") for child in node.get("Plans", [])
+        )
+        scans.append((node["Node Type"], index))
+    for child in node.get("Plans", []):
+        scans += _edge_scans(child)
+    return scans
 
 
 def _label_rows(node: dict) -> int:
@@ -416,17 +470,9 @@ def _budget(conn, probe: str, cypher: str, params: dict, returned: int) -> tuple
     return FACTOR * returned + SLACK, f"{returned} rows returned"
 
 
-# Known defects that this gate found, open in homelab#332. Strict: a fix makes
-# the probe pass, and then this entry must go.
-KNOWN_DEFECTS = {
-    "edge_reads": (
-        "A read by edge identity (_edges_by_identity) reads every outgoing edge of "
-        "each source through the start_id index, and filters the name and the "
-        "target after the join. On the copy (2026-11-10), one edge of the source "
-        "with the most edges read 1,273 label rows, and 20 of its edges read 25,551. "
-        "The edge identity index does not serve it."
-    ),
-}
+# Known defects that this gate found, open in homelab#332: {probe: reason}.
+# Strict: a fix makes the probe pass, and then its entry must go. None is open.
+KNOWN_DEFECTS: Dict[str, str] = {}
 
 
 @pytest.mark.parametrize(
@@ -442,22 +488,26 @@ async def test_each_read_follows_its_input_at_production_size(copy_adapter, prob
     inputs = await _discover(copy_adapter)
     _, call = PROBES[probe]
     statements = await _record(copy_adapter, call(copy_adapter, inputs))
-    assert statements, f"{probe} sent no Cypher statement"
+    assert statements, f"{probe} sent no data statement"
 
     problems = []
     with conftest.connect() as conn:
         for statement, args in statements:
             cypher = _cypher_text(statement)
-            params = json.loads(args[0])
+            params = _parameters(statement, args)
             for generic in (False, True):
                 plan = _explain(conn, statement, args, generic)
+                kind = "generic" if generic else "custom"
                 read = _label_rows(plan["Plan"])
                 returned = round(plan["Plan"].get("Actual Rows", 0))
                 budget, basis = _budget(conn, probe, cypher, params, returned)
                 if read > budget:
-                    kind = "generic" if generic else "custom"
                     problems.append(
                         f"{kind} plan read {read} label rows, budget {budget} ({basis}), "
                         f"{plan['Execution Time']:.0f} ms:\n{' '.join(cypher.split())}"
                     )
+                # D5: the index choice of the edge-id lookup is a cost decision.
+                scans = _edge_scans(plan["Plan"])
+                if statement == copy_adapter._edge_id_sql and scans != [("Index Scan", "edge_identity")]:
+                    problems.append(f"{kind} plan of the edge-id lookup scans the edges with {scans}")
     assert not problems, f"[{probe}]\n" + "\n\n".join(problems)

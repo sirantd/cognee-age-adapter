@@ -28,6 +28,7 @@ plans are not checked.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from uuid import uuid4
 
@@ -302,13 +303,116 @@ def test_the_workload_calls_every_public_data_method():
 )
 async def test_every_emitted_query_reads_its_labels_through_an_index(adapter, seeded, method):
     sent = await _record(adapter, _workload(seeded)[method])
-    cypher = [(sql, args) for sql, args in sent if sql.startswith("SELECT * FROM ag_catalog.cypher")]
-    assert cypher, f"{method} sent no Cypher statement"
+    statements = _data_statements(adapter, sent)
+    assert statements, f"{method} sent no data statement"
     if method in WHOLE_GRAPH_READS:
         return
 
-    for sql, args in cypher:
+    for sql, args in statements:
         plan = _plan(sql, args)
         assert "Disabled: true" not in plan, f"[{method}] a disabled plan node was needed:\n{sql}\n{plan}"
         problems = _unindexed_label_scans(plan)
         assert not problems, f"[{method}] label scan without an index:\n{sql}\n{plan}"
+
+
+def _data_statements(adapter, sent) -> list:
+    """The Cypher statements and the edge-id lookups (homelab#332 D5) of ``sent``."""
+    return [
+        (sql, args)
+        for sql, args in sent
+        if sql.startswith("SELECT * FROM ag_catalog.cypher") or sql == adapter._edge_id_sql
+    ]
+
+
+# A graph where each end of each edge has GRID edges: GRID sources x GRID targets.
+GRID = 30
+
+
+@pytest.fixture
+async def grid(adapter):
+    return await _build_grid(adapter)
+
+
+async def _build_grid(adapter):
+    """The grid, analyzed; 10 edges of one source and 10 edges of one target.
+
+    On the seeded graph, each end has approximately one edge, the costs of the
+    edge indexes tie, and the planner can pick any of them. Here each end has
+    30 edges, as the ends at production size have several.
+    """
+    sources = [Entity(id=uuid4(), name=f"s{i}") for i in range(GRID)]
+    targets = [Entity(id=uuid4(), name=f"t{i}") for i in range(GRID)]
+    await adapter.add_nodes(sources + targets)
+    await adapter.add_edges([(str(s.id), str(t.id), "links", {}) for s in sources for t in targets])
+    with conftest.connect() as conn:
+        for label in (NODE_LABEL, EDGE_LABEL):
+            conn.execute(f'ANALYZE "{adapter._graph_name}"."{label}"')
+    return [EdgeIdentity(str(sources[0].id), str(t.id), "links") for t in targets[:10]] + [
+        EdgeIdentity(str(s.id), str(targets[0].id), "links") for s in sources[1:11]
+    ]
+
+
+_KEY = make_source_ref_key(uuid4(), uuid4())
+
+# {method: call with the edges of the grid}: every public method that finds an
+# edge by its identity.
+_IDENTITY_CALLS = {
+    "has_edges": lambda x, edges: x.has_edges(
+        [(e.source_id, e.target_id, e.relationship_name, {}) for e in edges]
+    ),
+    "get_edge_delete_data": lambda x, edges: x.get_edge_delete_data(edges),
+    "attach_edge_source_refs": lambda x, edges: x.attach_edge_source_refs(edges, [_KEY]),
+    "remove_edge_source_refs": lambda x, edges: x.remove_edge_source_refs(edges, [_KEY]),
+    "delete_edge_triples": lambda x, edges: x.delete_edge_triples(edges),
+}
+
+
+def _analyzed(sql: str, args) -> dict:
+    """``EXPLAIN ANALYZE`` of one statement, with the knobs of ``_plan``.
+
+    In a transaction that rolls back: the statement runs, and it can be a write.
+    """
+    with conftest.connect() as conn:
+        with conn.transaction(force_rollback=True):
+            for knob in ("enable_seqscan", "enable_hashjoin", "enable_mergejoin"):
+                conn.execute(f"SET LOCAL {knob} = off")
+            return conn.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql, args).fetchone()[0][0]["Plan"]
+
+
+def _edge_scans(node: dict) -> list:
+    """``(node type, index, edge rows read)`` of each scan of the edge label."""
+    scans = []
+    if node.get("Relation Name") == EDGE_LABEL:
+        index = node.get("Index Name") or [child.get("Index Name") for child in node.get("Plans", [])]
+        read = (node.get("Actual Rows", 0) + node.get("Rows Removed by Filter", 0)) * node.get(
+            "Actual Loops", 0
+        )
+        scans.append((node["Node Type"], index, round(read)))
+    for child in node.get("Plans", []):
+        scans += _edge_scans(child)
+    return scans
+
+
+@pytest.mark.parametrize("method", sorted(_IDENTITY_CALLS))
+async def test_an_edge_identity_reads_only_its_own_edge(adapter, grid, method):
+    """🚨 homelab#332 D5: an index condition on one end alone passes the gate
+    above and reads every edge of that end. The edge-id lookup reads one edge
+    row for each edge, through the identity index, and the Cypher statement
+    after it reads the edge by its graphid. Measured on this grid
+    (2026-11-10): the Cypher identity match of b2709c5 read 300 edge rows for
+    20 edges, through ``Edge_end_id_idx``."""
+    sent = await _record(adapter, lambda x: _IDENTITY_CALLS[method](x, grid))
+    lookups = [(sql, args) for sql, args in sent if sql == adapter._edge_id_sql]
+    assert lookups, f"{method} sent no edge-id lookup"
+    by_id = [(sql, args) for sql, args in sent if "WHERE id(r) = e.id" in sql]
+    assert by_id or method == "has_edges", f"{method} sent no match by graphid"
+
+    for sql, args in lookups:
+        scans = _edge_scans(_analyzed(sql, args))
+        assert [scan[:2] for scan in scans] == [("Index Scan", "edge_identity")], scans
+        assert scans[0][2] <= len(args[0]), f"[{method}] {scans[0][2]} edge rows for {len(args[0])} edges"
+    for sql, args in by_id:
+        scans = _edge_scans(_analyzed(sql, args))
+        assert [scan[:2] for scan in scans] == [("Index Scan", "edge_id_btree")], scans
+        edges = len(json.loads(args[0])["edges"])
+        assert scans[0][2] <= edges, f"[{method}] {scans[0][2]} edge rows for {edges} edges"
