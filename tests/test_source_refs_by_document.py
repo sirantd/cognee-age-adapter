@@ -33,7 +33,10 @@ from cognee.infrastructure.databases.provenance import (
 )
 from cognee.infrastructure.engine import DataPoint
 
+import cognee_age_adapter.adapter as adapter_module
 from cognee_age_adapter import NODE_LABEL
+
+import conftest
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -163,6 +166,25 @@ async def test_every_dataset_document_pair_matches_the_oracle(adapter, world):
     for dataset_id in world["datasets"]:
         for data_id in world["documents"]:
             await _assert_matches_oracle(adapter, dataset_id, data_id)
+
+
+async def test_anchor_slices_and_no_dataset_index_condition(adapter, world, monkeypatch):
+    """🚨 homelab#332 D3. With ``r.source_dataset_ids @> [$dataset_id]`` in the
+    anchored read, the planner started from the GIN index and read every edge
+    of the dataset: 138 s for a document of 22 nodes on production. The
+    anchored read checks the dataset after the anchor, and goes in slices of
+    ANCHOR_BATCH anchors. Slices of one anchor must give the oracle's result."""
+    monkeypatch.setattr(adapter_module, "ANCHOR_BATCH", 1)
+    sent = conftest.record_sql(adapter)
+    try:
+        for dataset_id in world["datasets"]:
+            for data_id in world["documents"]:
+                await _assert_matches_oracle(adapter, dataset_id, data_id)
+    finally:
+        del adapter._execute
+    anchored = [sql for sql, args in sent if "$anchor_ids" in sql]
+    assert len(anchored) > len(world["datasets"]) * len(world["documents"]), "one slice per anchor"
+    assert not [sql for sql in anchored if "source_dataset_ids @>" in sql], anchored[0]
 
 
 async def test_shared_artifacts_return_only_this_documents_refs(adapter, world):

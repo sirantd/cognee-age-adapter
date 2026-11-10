@@ -409,6 +409,39 @@ async def test_filtered_graph_data_without_edges_runs_only_the_node_query(adapte
     assert [edge[2] for edge in edges] == ["knows"]
 
 
+async def test_a_filter_with_one_value_is_an_equality_not_an_unwind(adapter, monkeypatch):
+    """🚨 homelab#332 D2. PostgreSQL estimates 1,000 rows for any UNWIND of a
+    parameter, and at production size that estimate read all 207,123 nodes for
+    the FactConflict filter of every search. A filter with one value binds the
+    value itself; a filter with more values keeps the UNWIND."""
+    a, b, other = _Ent(id=uuid4(), name="A"), _Ent(id=uuid4(), name="B"), _Other(id=uuid4(), name="C")
+    await adapter.add_nodes([a, b, other])
+    await adapter.add_edges([(str(a.id), str(b.id), "knows", {})])
+
+    queries = []
+    real_query = adapter.query
+
+    async def recording_query(query, params=None):
+        queries.append((" ".join(query.split()), params))
+        return await real_query(query, params)
+
+    monkeypatch.setattr(adapter, "query", recording_query)
+
+    nodes, edges = await adapter.get_filtered_graph_data([{"type": ["_Ent"]}])
+    assert sorted(properties["name"] for _, properties in nodes) == ["A", "B"]
+    assert [(edge[0], edge[1]) for edge in edges] == [(str(a.id), str(b.id))]
+    node_query, params = queries[0]
+    assert "UNWIND" not in node_query and "n.`type` = $filter_0" in node_query, node_query
+    assert params["filter_0"] == "_Ent"
+
+    queries.clear()
+    nodes, _ = await adapter.get_filtered_graph_data(
+        [{"type": ["_Ent", "_Other"]}], include_edges=False
+    )
+    assert sorted(properties["name"] for _, properties in nodes) == ["A", "B", "C"]
+    assert queries[0][0].startswith("UNWIND $filter_0 AS wanted"), queries[0][0]
+
+
 async def test_remove_belongs_to_set_tags_also_prunes_the_stale_nodeset_edge(adapter):
     """The contract suite checks the property; the edge half is ours to prove."""
     node = _Ent(id=uuid4(), name="Shared", belongs_to_set=["Dev"])

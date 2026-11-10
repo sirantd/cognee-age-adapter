@@ -37,6 +37,8 @@ class _RecordingCursor:
         self.sent = sent
 
     async def execute(self, sql, args=None):
+        if "pg_advisory_xact_lock" in sql:
+            return  # the write lock (D4) carries keys, not a Cypher parameter map
         self.sent.append((sql, json.loads(args[0]) if args else None))
 
     async def fetchall(self):

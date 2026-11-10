@@ -113,6 +113,19 @@ Each rule is a measurement on AGE 1.8.0, and each has a test.
 * A lookup by a list of values is `UNWIND $values AS v ... WHERE n.p = v`.
   `WHERE n.p IN $values` compiles to `agtype_in_operator`, which no index
   serves. `IN` stays only as a filter after an index-backed step.
+* An `IN` against a long list reads the whole list for each row. The read of
+  the edges among a scope of 5,339 nodes took 12.7 s with `m.id IN $ids`, and
+  2.8 s with the target filter in Python (homelab#332, D1; a production-size
+  copy under amd64 emulation).
+* A filter with one value is `WHERE n.p = $value`, not an `UNWIND`.
+  PostgreSQL estimates 1,000 rows for every `UNWIND` of a parameter. At
+  production size that estimate read all 207,123 nodes for the FactConflict
+  filter of every search (homelab#332, D2).
+* A read that starts from given nodes has no other condition that an index
+  serves for many rows. The planner estimated 818 rows for the dataset GIN
+  condition `r.source_dataset_ids @> [$id]` (651,981 actual), started from
+  it, and took 138 s for a document of 22 nodes (homelab#332, D3). Such a
+  condition goes after the anchor, in a form that no index serves (`$id IN`).
 * A pattern map `{id: $x}` compiles to `properties @> {...}`, which only a GIN
   index over all properties serves. Lookups use `WHERE` instead.
 * A vertex `MERGE` matches with such a pattern map. So `add_nodes` creates the
@@ -131,17 +144,35 @@ Each rule is a measurement on AGE 1.8.0, and each has a test.
 
 ### Concurrent writers
 
-Two cognify workers in two processes can create the same node or edge at the
-same moment. The unique indexes turn the race into a unique violation, and the
-adapter runs the losing transaction again, up to five times. A deadlock or a
-serialization failure is run again in the same way. The batches are sorted, so
-that two writers take the index locks in the same order.
+cognify workers in several processes can write the same node or edge at the
+same moment. A NodeSet node carries the key of every document of its set, so
+every document of one set writes it.
 
 🚨 AGE does not re-check a row that a concurrent transaction updated, as a
 native `UPDATE` does. The `SET` waits for the other commit and then fails with
-`XX000 Entity failed to be updated: 3`. Every idempotent write runs again on
-this error. A provenance attach or remove reads the row again before it runs
-again, so the key of the other writer stays.
+`XX000 Entity failed to be updated: 3`. On 2026-11-10, with 5 writers on
+production, 9 of 80 batches failed after five attempts, and their nodes and
+edges were lost (homelab#332, D4).
+
+So every node and edge write takes a transaction-level advisory lock for each
+node id or edge identity, in sorted order, in its first statement
+(`pg_advisory_xact_lock`). A second writer of the same node waits for the first
+commit, and its Cypher statements then read the committed row. An edge locks
+its identity, not its end nodes: every edge of a set ends at the one NodeSet
+node. The locked writes are `add_nodes`, `add_edges`, the attach and remove of
+source refs, and `set_node_truth_state`. An attach or remove reads, changes and
+writes the provenance in one locked transaction, so a writer in another process
+cannot commit between the read and the write.
+
+🚨 The advisory locks of all sessions share the lock table of the server, for
+every database of the app. In a local container of the production image, 14,000
+locks fit and 16,000 failed with `out of shared memory`. So one transaction
+locks at most 256 nodes or edges (`LOCK_BATCH`), and a larger batch is written
+in transactions of that size. Each node stays atomic; a batch is not.
+
+The unique indexes stay. A write that still loses a race (a unique violation, a
+deadlock, a serialization failure, or `XX000` from a writer without the locks,
+such as `remove_belongs_to_set_tags`) runs again, up to five times.
 
 ## Coercion
 
@@ -167,6 +198,31 @@ joins and merge joins disabled, the plan must have no disabled node, and every
 scan of a label table must carry an `Index Cond` or a `Recheck Cond`. A census
 fails when a public method is missing from the workload. Five methods read the
 whole graph by design, and they are listed by name.
+
+### At production size
+
+🚨 The CI gate cannot see a plan that the planner picks only at production
+size: D2 and D3 of homelab#332 passed it. `tests/test_plans_production.py` runs
+the reads of the live path and of the per-document delete on a copy of the
+production graph, with the default planner settings. It plans each statement
+with its parameters and again as a generic plan (psycopg prepares a statement
+after five runs). It limits the label rows that each statement reads:
+
+| statement | may read |
+|---|---|
+| with an id list (`$anchor_ids`, `$ids`) | 3 × (the ids + the edges of those nodes) + 1,000 |
+| dataset-wide by design (the node pass and the chunk sweep of the per-document lookups) | each label once |
+| any other | 3 × the rows it returns + 1,000 |
+
+"No Seq Scan" is not the check: the D3 plan was index-backed and still read the
+whole dataset. The test reads only, takes its inputs from the graph, and is
+skipped unless `AGE_COPY_GRAPH` names the copy. See [Testing](#on-a-production-size-copy).
+Without a copy, a census still runs: each public read is probed or excluded by
+name.
+
+⚠ One known defect is a strict `xfail` (`KNOWN_DEFECTS`): a read by edge
+identity reads every outgoing edge of the source. On the copy, 20 edges of the
+node with the most outgoing edges read 25,551 label rows.
 
 ## Testing
 
@@ -198,6 +254,20 @@ ci/fetch-age.sh .ci-age
 AGE_CONTAINER=age-prod AGE_PORT=55433 DOCKER_PLATFORM=linux/amd64 ci/start-postgres.sh .ci-age
 AGE_PORT=55433 AGE_REQUIRED=1 .venv/bin/pytest
 ```
+
+### On a production-size copy
+
+Load a copy of the production graph into the production layout above (the
+homelab `scripts/age-migration/cognee_copy.py load`, see homelab
+`docs/age-migration.md`), run `ANALYZE` on `Node` and `Edge`, then:
+
+```sh
+AGE_PORT=55433 AGE_REQUIRED=1 AGE_COPY_GRAPH=cognee_graph .venv/bin/pytest tests/test_plans_production.py
+```
+
+The rest of the suite makes its own throwaway graphs and does not touch the
+copy. 🚨 Never point the `adapter` fixture or the workload of
+`tests/test_plans.py` at the copy: the workload calls `delete_graph`.
 
 ### CI
 
