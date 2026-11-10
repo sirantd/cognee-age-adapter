@@ -23,5 +23,9 @@ ALTER ROLE :"role" IN DATABASE :"database" SET session_preload_libraries = 'age'
 ALTER ROLE :"role" IN DATABASE :"database" SET search_path = ag_catalog, "$user", public;
 -- homelab#332 story 6: one long graph query stops and cannot freeze the store.
 -- 5 min is the query timeout of cognee's FalkorDB store (homelab #253); Stage C
--- confirms the production value.
+-- set it in production.
 ALTER ROLE :"role" IN DATABASE :"database" SET statement_timeout = '5min';
+-- homelab#332: a dead client cannot keep the locks of its open transaction.
+-- Production has 1 min for both graph roles (2026-11-10). The adapter makes no
+-- external call inside a transaction.
+ALTER ROLE :"role" IN DATABASE :"database" SET idle_in_transaction_session_timeout = '1min';
