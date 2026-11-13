@@ -15,7 +15,7 @@ disk-resident storage.
 cognee-falkordb-adapter 0.5.4, with the same public surface, provenance
 semantics and value rules. The CI gate runs against the production store:
 
-* cognee's own provenance contract suite must pass 20/20 (cognee `1.6.7`).
+* cognee's own provenance contract suite must pass 20/20 (cognee `1.6.8`).
 * Every query that the adapter emits must read its label tables through an
   index (see [The plan gate](#the-plan-gate)).
 
