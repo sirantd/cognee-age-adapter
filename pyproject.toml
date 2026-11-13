@@ -23,11 +23,12 @@ dependencies = [
 # cognee image that already provides it. Pinned exactly for tests because the
 # contract suite is the only drift detector for the graph interface.
 #
-# 📌 1.6.7 is the version in the homelab cognee image when Stage A of
-# homelab#332 started (2026-11-08). The issue keeps this pin for the whole
-# migration: a cognee bump is out of scope until the cutover is done.
+# 📌 1.6.8 is the version of the next homelab cognee image (2026-11-13). The
+# homelab#332 cutover is done, so the pin moves with the image. From 1.6.7,
+# graph_db_interface.py, databases/unified/ and the contract suite have no
+# diff. In databases/graph/, only the ladybug adapter changed.
 test = [
-  "cognee==1.6.7",
+  "cognee==1.6.8",
   "pytest>=8",
   "pytest-asyncio>=0.24",
 ]
