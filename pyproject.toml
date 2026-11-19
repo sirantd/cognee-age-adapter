@@ -23,12 +23,13 @@ dependencies = [
 # cognee image that already provides it. Pinned exactly for tests because the
 # contract suite is the only drift detector for the graph interface.
 #
-# 📌 1.6.8 is the version of the next homelab cognee image (2026-11-13). The
-# homelab#332 cutover is done, so the pin moves with the image. From 1.6.7,
-# graph_db_interface.py, databases/unified/ and the contract suite have no
-# diff. In databases/graph/, only the ladybug adapter changed.
+# 📌 1.6.10 is the version of the next homelab cognee image (2026-11-19). From
+# 1.6.8, the contract suite and databases/unified/ have no diff, and
+# graph_db_interface.py changed in its docstrings only. In databases/graph/,
+# only the pool defaults of postgres_demo changed. add_data_points now writes
+# the node vectors while it writes the edge rows of the graph.
 test = [
-  "cognee==1.6.8",
+  "cognee==1.6.10",
   "pytest>=8",
   "pytest-asyncio>=0.24",
 ]
