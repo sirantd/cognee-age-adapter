@@ -127,6 +127,10 @@ EdgeData = Tuple[str, str, str, Dict[str, Any]]
 
 _PROVENANCE_KEY_SET = frozenset(PROVENANCE_COLUMNS)
 
+# The characters that ``str.strip()`` removes (``str.isspace()``), for ``btrim``.
+# The last one is U+3000.
+_PYTHON_WHITESPACE = "".join(chr(code) for code in range(0x3001) if chr(code).isspace())
+
 # The vertex properties with a btree index. A filtered read on one of them is an
 # index scan; on any other property it reads the whole label.
 _INDEXED_NODE_PROPERTIES = frozenset(name for name, _ in NODE_BTREE_INDEXES)
@@ -205,6 +209,48 @@ def _property(prop: str, alias: str = "") -> str:
     column = f"{alias}.properties" if alias else "properties"
     literal = json.dumps(prop).replace("'", "''")
     return f"ag_catalog.agtype_access_operator(VARIADIC ARRAY[{column}, '{literal}'::{AGTYPE}])"
+
+
+def _edge_texts_sql(graph: str) -> str:
+    """SQL that returns the edges whose retrieval text may be one of ``%(edge_texts)s``.
+
+    A superset; ``find_edge_texts_in_use`` decides on the rows. One scan of the
+    ``Edge`` table: no index serves a stripped text.
+    """
+    return f"""
+        SELECT DISTINCT ag_catalog.agtype_out(edge_text)::text AS edge_text,
+                        ag_catalog.agtype_out(relationship_name)::text AS relationship_name
+        FROM (
+            SELECT {_property("edge_text")} AS edge_text,
+                   {_property(REL)} AS relationship_name
+            FROM "{graph}"."{E}"
+        ) AS edge
+        WHERE coalesce(
+                  nullif(btrim(edge_text::text, %(whitespace)s), ''),
+                  nullif(btrim(relationship_name::text, %(whitespace)s), ''),
+                  ''
+              ) = ANY(%(edge_texts)s)
+           OR left(ag_catalog.agtype_out(edge_text)::text, 1) <> '"'
+        """
+
+
+def _edge_texts_probe_sql(graph: str) -> str:
+    """SQL: is the database UTF8, and how many edges remain, counted up to ``%(asked)s``."""
+    return f"""
+        SELECT pg_encoding_to_char(encoding) = 'UTF8' AS is_utf8,
+               (SELECT count(*) FROM (SELECT 1 FROM "{graph}"."{E}" LIMIT %(asked)s) AS edge)
+        FROM pg_database
+        WHERE datname = current_database()
+        """
+
+
+def _edge_texts_all_sql(graph: str) -> str:
+    """SQL that returns the edge text and relationship name of every edge."""
+    return f"""
+        SELECT DISTINCT ag_catalog.agtype_out({_property("edge_text")})::text AS edge_text,
+                        ag_catalog.agtype_out({_property(REL)})::text AS relationship_name
+        FROM "{graph}"."{E}"
+        """
 
 
 def _edge_id_sql(graph: str) -> str:
@@ -536,6 +582,9 @@ class AGEAdapter(GraphDBInterface):
             database_name or graph_database_name or DEFAULT_GRAPH_NAME
         )
         self._edge_id_sql = _edge_id_sql(self._graph_name)
+        self._edge_texts_sql = _edge_texts_sql(self._graph_name)
+        self._edge_texts_probe_sql = _edge_texts_probe_sql(self._graph_name)
+        self._edge_texts_all_sql = _edge_texts_all_sql(self._graph_name)
 
         if graph_database_key:
             logger.warning(
@@ -951,8 +1000,16 @@ class AGEAdapter(GraphDBInterface):
         nodes: Union[List[Node], List[DataPoint]],
         source_ref_key: Optional[str] = None,
         pipeline_run_id: Optional[str] = None,
+        *,
+        replace: bool = False,
     ) -> None:
         """Add or update many nodes, stamping provenance in the same write.
+
+        ``replace`` (cognee 1.6.11) is accepted and changes nothing. cognee passes
+        it when the incoming properties must win over a stored node (entity
+        consolidation). This adapter always writes them: ``SET n += properties``
+        stores every incoming value. A stored key that the incoming node does not
+        carry stays, as it does without ``replace``.
 
         Three statements in ONE transaction, so no reader sees a half-written node:
 
@@ -1751,6 +1808,72 @@ class AGEAdapter(GraphDBInterface):
                     )
                 ] = owned
         return result
+
+    # --- per-data lookups: on GraphDBInterface from cognee 1.6.11 --------------
+    #
+    # cognee 1.6.11 calls these from ``UnifiedStoreEngine.delete_by_document``.
+    # The interface default reads every ref of the dataset and filters it in
+    # Python, the read that the per-document lookups above exist to avoid. Their
+    # result is the same: the keys of one data item of one dataset, v1 and v2.
+
+    async def find_node_source_refs_by_data(
+        self, dataset_id: str, data_id: str
+    ) -> dict[str, list[str]]:
+        """``{node_id: keys}`` for the refs one data item of one dataset owns."""
+        return await self.find_node_source_refs_by_document(str(dataset_id), str(data_id))
+
+    async def find_edge_source_refs_by_data(
+        self, dataset_id: str, data_id: str
+    ) -> dict[EdgeIdentity, list[str]]:
+        """``{edge: keys}`` for the refs one data item of one dataset owns."""
+        return await self.find_edge_source_refs_by_document(str(dataset_id), str(data_id))
+
+    async def find_edge_texts_in_use(self, edge_texts: list[str]) -> set[str]:
+        """The given retrieval texts that at least one stored edge still has.
+
+        An edge's retrieval text is ``get_edge_retrieval_text`` of its
+        ``edge_text`` and its relationship name: the stripped ``edge_text``, else
+        the stripped name. cognee asks this after a provenance delete, to drop the
+        EdgeType of a text that no edge has any more.
+
+        The interface default reads the whole graph into the client (8.47 GB on
+        the FalkorDB copy of 2026-09). Here PostgreSQL reads the ``Edge`` table
+        and sends back only the edges whose text is asked, so the client holds
+        only those. 🚨 It is still one sequential scan of the ``Edge`` table for
+        each call: no index serves a stripped text. The plan gate lists it as a
+        whole-graph read.
+
+        The SQL condition is a superset, and ``get_edge_retrieval_text`` decides
+        on the returned rows. ``agtype::text`` gives a string without its quotes,
+        and ``btrim`` strips the characters that ``str.strip()`` strips. An
+        ``edge_text`` that is not a string has no faithful SQL text, so every
+        such edge comes back. In a database that is not UTF8, or when fewer edges
+        remain than texts are asked, every edge comes back instead.
+        """
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        wanted = set(edge_texts)
+        if not wanted:
+            return set()
+        # As upstream's Postgres adapter: the narrowing is exact only in UTF8, and it
+        # is worth it only while more edges remain than texts are asked. After a
+        # dataset delete the texts can outnumber the edges left; then read them all.
+        is_utf8, remaining = (
+            await self._sql(self._edge_texts_probe_sql, {"asked": len(wanted)})
+        )[0]
+        if is_utf8 and remaining == len(wanted):
+            rows = await self._sql(
+                self._edge_texts_sql,
+                {"whitespace": _PYTHON_WHITESPACE, "edge_texts": sorted(wanted)},
+            )
+        else:
+            rows = await self._sql(self._edge_texts_all_sql)
+        in_use: set[str] = set()
+        for edge_text, relationship_name in rows:
+            text = get_edge_retrieval_text(agtype.parse(edge_text), agtype.parse(relationship_name))
+            if text in wanted:
+                in_use.add(text)
+        return in_use
 
     async def find_node_source_refs_by_pipeline_run(
         self, pipeline_run_id: str

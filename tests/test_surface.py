@@ -27,8 +27,9 @@ from cognee_age_adapter import AGEAdapter
 RUNTIME_REACHED = frozenset(
     """
     attach_edge_source_refs attach_node_source_refs delete_edge_triples
-    find_edge_source_refs_by_dataset find_edge_source_refs_by_pipeline_run
-    find_edges_by_source_ref find_node_source_refs_by_dataset
+    find_edge_source_refs_by_data find_edge_source_refs_by_dataset
+    find_edge_source_refs_by_pipeline_run find_edge_texts_in_use
+    find_edges_by_source_ref find_node_source_refs_by_data find_node_source_refs_by_dataset
     find_node_source_refs_by_pipeline_run find_nodes_by_source_ref
     get_edge_delete_data get_graph_metadata get_node_delete_data
     get_node_truth_state get_triplets_batch remove_edge_source_refs
@@ -59,12 +60,16 @@ MUST_OVERRIDE_A_REAL_DEFAULT = frozenset({"remove_belongs_to_set_tags"})
 # DataPoint.py references it). Upstream declares it an "optional extension" for
 # exactly this reason. 💡 If a caller ever lands on the cognify path, implement it
 # as a read-modify-write MERGE and move it into RUNTIME_REACHED.
+#
+# ``get_node_ids_by_property`` and ``get_outgoing_edge_keys`` (cognee 1.6.11) are
+# reached only by the code-graph load (``codify``). The homelab never runs it, and
+# the default raises NotImplementedError, so only a code-graph load fails.
 DELIBERATELY_UNIMPLEMENTED = frozenset(
     """
     get_edge_feedback_weights get_edge_frequency_weights get_node_feedback_weights
     get_node_frequency_weights set_edge_feedback_weights set_edge_frequency_weights
     set_node_feedback_weights set_node_frequency_weights
-    update_node
+    update_node get_node_ids_by_property get_outgoing_edge_keys
     """.split()
 )
 

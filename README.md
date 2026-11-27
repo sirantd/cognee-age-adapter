@@ -15,7 +15,7 @@ disk-resident storage.
 cognee-falkordb-adapter 0.5.4, with the same public surface, provenance
 semantics and value rules. The CI gate runs against the production store:
 
-* cognee's own provenance contract suite must pass 20/20 (cognee `1.6.10`).
+* cognee's own provenance contract suite must pass 22/22 (cognee `1.6.11`).
 * Every query that the adapter emits must read its label tables through an
   index (see [The plan gate](#the-plan-gate)).
 
@@ -208,7 +208,7 @@ statement at the one place the adapter sends SQL, and asks PostgreSQL for the
 plan of exactly that statement with its parameters. With sequential scans, hash
 joins and merge joins disabled, the plan must have no disabled node, and every
 scan of a label table must carry an `Index Cond` or a `Recheck Cond`. A census
-fails when a public method is missing from the workload. Five methods read the
+fails when a public method is missing from the workload. Six methods read the
 whole graph by design, and they are listed by name.
 
 ### At production size
@@ -289,7 +289,7 @@ copy. 🚨 Never point the `adapter` fixture or the workload of
 * The `contract` job runs the integration tests on the production image digest,
   as uid 999 with its `PGDATA` and command. AGE is mounted read-only, and the
   tests connect as a non-superuser graph role. `AGE_REQUIRED=1` turns an absent
-  server into a failure, not 20 skips.
+  server into a failure, not 22 skips.
 * The `age-source` workflow proves that the pinned PGDG package is the ASF
   1.8.0 release (`ci/verify-age-source.sh`). It runs when a pin changes.
 
@@ -297,7 +297,7 @@ copy. 🚨 Never point the `adapter` fixture or the workload of
 
 The pins are in `pyproject.toml` (cognee) and `ci/pins.env` (the PostgreSQL
 image and the AGE package). `tests/test_contract_pin.py` fails when the cognee
-pin or the 20 contract cases change.
+pin or the 22 contract cases change.
 
 ⚠ PGDG moves superseded packages from `apt.postgresql.org` to
 `apt-archive.postgresql.org`. If `ci/fetch-age.sh` fails with a 404, point

@@ -318,6 +318,9 @@ NOT_PROBED = {
     "get_triplets_batch": "pages through the whole graph by design",
     "find_node_source_refs_by_dataset": "reads the whole dataset by design (delete_by_dataset)",
     "find_edge_source_refs_by_dataset": "reads the whole dataset by design (delete_by_dataset)",
+    "find_node_source_refs_by_data": "calls find_node_source_refs_by_document (document probes)",
+    "find_edge_source_refs_by_data": "calls find_edge_source_refs_by_document (document probes)",
+    "find_edge_texts_in_use": "one sequential scan of Edge by design; timed in the homelab deploy",
 }
 
 # The write methods: never on a copy (the CI gate checks their plans).

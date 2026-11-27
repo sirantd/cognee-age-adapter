@@ -10,19 +10,19 @@ own docstring invites this:
 by editing cognee.** The suite ships inside the cognee wheel, so an edited copy
 would live in ``site-packages``: unversioned, silently reverted by the next
 ``pip install``, and invisible in review. The star-import below binds the same
-20 test functions into this module, where pytest collects them and resolves
+22 test functions into this module, where pytest collects them and resolves
 ``graph_provenance_adapter`` against the definition here.
 
 ⚠ **The suite is a gate only while the cognee it came from is pinned.**
 ``pyproject.toml`` pins it exactly and ``test_contract_pin.py`` enforces the pin
-and the 20 names, so drift fails here and not in the 03:00 drain.
+and the 22 names, so drift fails here and not in the 03:00 drain.
 """
 
 from __future__ import annotations
 
 import pytest
 
-# The suite itself. The star-import puts the 20 test functions in this module's
+# The suite itself. The star-import puts the 22 test functions in this module's
 # namespace for pytest to collect, and lets the fixture below shadow the
 # suite's fixture by name.
 from cognee.tests.integration.infrastructure.graph.test_graph_provenance_adapter_contract import *  # noqa: F401,F403

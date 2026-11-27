@@ -22,7 +22,7 @@ jobs:
       - run: pytest -m "not integration"
 
   contract:
-    # The real gate: cognee's own provenance contract suite (20 cases,
+    # The real gate: cognee's own provenance contract suite (22 cases,
     # unmodified) and the adapter's integration tests, against the PRODUCTION
     # store: the TrueNAS app's image digest unchanged, run as uid 999 with its
     # PGDATA and command, AGE mounted read-only from the pinned PGDG package,
@@ -39,7 +39,7 @@ jobs:
       AGE_PASSWORD: cognee_graph
       AGE_DATABASE: cognee_graph
       # 🚨 A skipped gate is a green gate. Without a server the fixtures skip,
-      # and 20 skips read as 20 passes in the job summary. This fails instead.
+      # and 22 skips read as 22 passes in the job summary. This fails instead.
       AGE_REQUIRED: "1"
       # The adapter refuses to register if anything points the VECTOR store
       # away from pgvector.
@@ -56,7 +56,7 @@ jobs:
         run: ci/start-postgres.sh "$RUNNER_TEMP/age"
       - name: cognee provenance contract suite
         # Its own step, so a red build says which half broke: cognee's
-        # contract, or the adapter's own behaviour. Expect "20 passed".
+        # contract, or the adapter's own behaviour. Expect "22 passed".
         run: pytest tests/test_contract.py -v
       - name: adapter integration tests
         run: pytest -m integration -v --ignore=tests/test_contract.py
