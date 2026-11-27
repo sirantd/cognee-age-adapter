@@ -53,7 +53,14 @@ LABEL_TABLES = (NODE_LABEL, EDGE_LABEL, METADATA_LABEL, "_ag_label_vertex", "_ag
 
 # Methods whose job is a read or a delete of the whole graph. Asserted by name.
 WHOLE_GRAPH_READS = frozenset(
-    {"delete_graph", "get_graph_data", "get_graph_metrics", "get_triplets_batch", "is_empty"}
+    {
+        "delete_graph",
+        "find_edge_texts_in_use",  # one scan of Edge: no index serves a stripped text
+        "get_graph_data",
+        "get_graph_metrics",
+        "get_triplets_batch",
+        "is_empty",
+    }
 )
 
 # Public methods that send no data query: DDL, the pool, a pure function, and
@@ -131,6 +138,13 @@ def _workload(seed):
         "find_edge_source_refs_by_document": lambda x: x.find_edge_source_refs_by_document(
             dataset_id, data_id
         ),
+        "find_node_source_refs_by_data": lambda x: x.find_node_source_refs_by_data(
+            dataset_id, data_id
+        ),
+        "find_edge_source_refs_by_data": lambda x: x.find_edge_source_refs_by_data(
+            dataset_id, data_id
+        ),
+        "find_edge_texts_in_use": lambda x: x.find_edge_texts_in_use(["t", "knows"]),
         "find_node_source_refs_by_pipeline_run": lambda x: x.find_node_source_refs_by_pipeline_run(
             run_id
         ),
@@ -316,11 +330,19 @@ async def test_every_emitted_query_reads_its_labels_through_an_index(adapter, se
 
 
 def _data_statements(adapter, sent) -> list:
-    """The Cypher statements and the edge-id lookups (homelab#332 D5) of ``sent``."""
+    """The Cypher statements, the edge-id lookups (homelab#332 D5) and the edge-text
+    scan (cognee 1.6.11) of ``sent``."""
     return [
         (sql, args)
         for sql, args in sent
-        if sql.startswith("SELECT * FROM ag_catalog.cypher") or sql == adapter._edge_id_sql
+        if sql.startswith("SELECT * FROM ag_catalog.cypher")
+        or sql
+        in (
+            adapter._edge_id_sql,
+            adapter._edge_texts_sql,
+            adapter._edge_texts_probe_sql,
+            adapter._edge_texts_all_sql,
+        )
     ]
 
 
